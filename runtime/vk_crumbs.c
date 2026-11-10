@@ -138,6 +138,9 @@ void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) {
 #define GP_TOP 30
 typedef struct { uint8_t kind, used; uint32_t w, h, d, draws, layer; int c0; uint64_t vs, fs; } GpLabel;
 static GpLabel gp_labels[GP_SLOTS];
+// The slots the timestamp pool holds: GP_SLOTS, or fewer where the driver refuses a pool that large (MoltenVK backs it
+// with a Metal counter sample buffer, which failed at 32768 timestamps on an M1 Max).
+static uint32_t gp_slots = GP_SLOTS;
 // The gap ledger: what the timed frames' parts spend outside their passes and dispatches. A part (vk_sync.c: one command
 // buffer of a submission) takes a slot of its own, kind GP_KIND_PART, with a timestamp at its start and its end. A gap
 // runs from the part's start or the end of a mark to the start of the next mark or the part's end; vk_gpu_gap_note
@@ -195,7 +198,7 @@ void vk_gpu_gap_note(int kind, uint64_t units) {
 void vk_gpu_passes_part(VkCommandBuffer cb, int end) {
     if (!end) {
         gp_part = UINT32_MAX, gp_gap_from = UINT32_MAX, gp_gap_kinds = 0;
-        if (!gp_capture || gp_n >= GP_SLOTS) return;
+        if (!gp_capture || gp_n >= gp_slots) return;
         gp_labels[gp_n] = (GpLabel){.kind = GP_KIND_PART};
         vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, gp_n * 2);
         gp_part = gp_n++;
@@ -211,7 +214,7 @@ void vk_gpu_passes_part(VkCommandBuffer cb, int end) {
 
 static void gp_begin(VkCommandBuffer cb, VkPassMark *m) {
     m->gp = 0;
-    if (!gp_capture || gp_n >= GP_SLOTS) return;
+    if (!gp_capture || gp_n >= gp_slots) return;
     if (gp_part != UINT32_MAX) gp_gap_close(gp_n * 2);   // the gap before this mark ends at its start
     gp_labels[gp_n].used = 0;
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_pool, gp_n * 2);
@@ -409,30 +412,34 @@ void vk_gpu_passes_frame(uint64_t frame) {
         const char *e = cfg_get("NX2NAVI_GPU_PASSES");
         if (!e || !*e || !strcmp(e, "0") || !c) return;
         VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                                    .queryCount = GP_SLOTS * 2};
-        if (!vk_pass_marks_on || vkCreateQueryPool(c->device, &qi, NULL, &gp_pool) != VK_SUCCESS) {
+                                    .queryCount = gp_slots * 2};
+        VkResult qr = VK_ERROR_FEATURE_NOT_PRESENT;
+        while (vk_pass_marks_on && (qr = vkCreateQueryPool(c->device, &qi, NULL, &gp_pool)) != VK_SUCCESS && gp_slots > 512)
+            gp_slots /= 2, qi.queryCount = gp_slots * 2;
+        if (qr != VK_SUCCESS) {
             rt_log("gpu passes: not available (needs the pass marks and a timestamp pool)");
             return;
         }
         if (c->has_mesh_queries) {
             VkQueryPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                                        .queryType = VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT, .queryCount = GP_SLOTS};
+                                        .queryType = VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT, .queryCount = gp_slots};
             if (vkCreateQueryPool(c->device, &pi, NULL, &gp_prims) != VK_SUCCESS) gp_prims = VK_NULL_HANDLE;
         }
         {
             VkQueryPoolCreateInfo si = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS,
-                                        .queryCount = GP_SLOTS,
+                                        .queryCount = gp_slots,
                                         .pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT};
             if (vkCreateQueryPool(c->device, &si, NULL, &gp_stats) != VK_SUCCESS) gp_stats = VK_NULL_HANDLE;
         }
         gp_state = 1;
-        rt_log("gpu passes: timing %d frames every %d presents (NX2NAVI_GPU_PASSES)", GP_FRAMES, GP_PERIOD);
+        rt_log("gpu passes: timing %d frames every %d presents, %u slots (NX2NAVI_GPU_PASSES)", GP_FRAMES, GP_PERIOD,
+               gp_slots);
     }
     if (gp_phase == 0) {
         if (frame % GP_PERIOD) return;
-        vkResetQueryPool(c->device, gp_pool, 0, GP_SLOTS * 2);
-        if (gp_prims) vkResetQueryPool(c->device, gp_prims, 0, GP_SLOTS);
-        if (gp_stats) vkResetQueryPool(c->device, gp_stats, 0, GP_SLOTS);
+        vkResetQueryPool(c->device, gp_pool, 0, gp_slots * 2);
+        if (gp_prims) vkResetQueryPool(c->device, gp_prims, 0, gp_slots);
+        if (gp_stats) vkResetQueryPool(c->device, gp_stats, 0, gp_slots);
         gp_ngaps = 0, gp_gap_from = UINT32_MAX, gp_gap_kinds = 0, gp_part = UINT32_MAX;
         memset(gp_kind_n, 0, sizeof gp_kind_n), memset(gp_kind_units, 0, sizeof gp_kind_units);
         gp_n = 0, gp_start = frame, gp_capture = 1, gp_phase = 1;
