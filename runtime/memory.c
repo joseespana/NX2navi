@@ -6,7 +6,7 @@
 // Every region is a plain reservation; pages are committed and decommitted at 4 KiB granularity. Decommitted pages
 // come back zeroed, so no stale-page bookkeeping is needed. The stack and heap block and the alias region are
 // reserved write-watched (platform.h plat_mem_reserve): mem_written_pages reports the pages the CPU wrote, which
-// the Vulkan back end uploads again.
+// the Vulkan back end uploads again. The heap's pages are committed when they are first touched (heap_fault).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,7 +51,7 @@ static uint64_t mods_lo, mods_hi;   // fixed module window
 static uint64_t alias_size = ALIAS_SIZE;
 static const uint64_t low_size = LOW_SIZE, heap_cap = HEAP_CAP;
 static PlatMutex lock = PLAT_MUTEX_INIT;
-static uint64_t heap_size, alias_bytes;
+static uint64_t heap_size, alias_bytes;   // heap_size: written under lock and heap_lock, read under either
 static uint8_t *alias_pages;        // 1 per mapped 4 KiB page of the alias region
 typedef struct { uint64_t dst, src, size; } StackMap;
 static StackMap stack_maps[MAX_STACK_MAPS];
@@ -415,6 +415,7 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {
+    mem_touch(a, n);   // the kernel's access fails on a heap page nothing has touched yet, too
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
@@ -517,9 +518,13 @@ static int probe_fault(uint64_t a, int write, uint64_t ip) {
     return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) >= PLAT_PROT_READ;
 }
 
-// The platform's access-fault hook: an armed page of the lazy write-back first, then the probe. A read that faulted on
-// a page another thread gave back meanwhile runs again; a write goes on to thaw_fault.
+static int heap_fault(uint64_t a);
+
+// The platform's access-fault hook: a heap page nothing has touched yet first (heap_fault), then an armed page of the
+// lazy write-back, then the probe. A read that faulted on a page another thread gave back meanwhile runs again; a
+// write goes on to thaw_fault.
 static int access_fault(uint64_t a, int write, uint64_t ip) {
+    if (heap_fault(a)) return 1;
     if (__atomic_load_n(&lz_on, __ATOMIC_RELAXED) && lazy_fault(a, write)) return 1;
     if (__atomic_load_n(&prb_on, __ATOMIC_RELAXED)) return probe_fault(a, write, ip);
     if (write || a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
@@ -602,6 +607,81 @@ static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
     if (!ok) rt_fatal("memory: protect %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
 }
 
+// ---- heap pages committed at their first touch
+// The game asks for its whole heap at once (SetHeapSize, 6.9 GiB in Ocarina) and hands it to allocators that leave much
+// of it unused: 17 minutes into play, 1068 of the heap's 3455 regions of 2 MiB (2.1 GiB) held no page the game had
+// ever read or written. Windows charges a committed page to the system's commit limit (memory plus page file) when it
+// is committed, touched or not, and on a PC whose commit runs out the graphics driver's allocations fail and the
+// Vulkan device is lost. So SetHeapSize only records the size, and the heap's pages stay reserved until something
+// touches them: the access faults (access_fault, which mem_init registers for this), heap_fault commits the 2 MiB
+// region around it (the regions of mem_freeze, so a region is backed whole or not at all) and the access runs again.
+// A reserved page of the heap reads as zero, as a committed and untouched one did.
+//
+// The fault reaches every access from this process's own code, the game's and the runtime's alike. An access by the
+// host's kernel does not fault, it fails: a file read into the heap, a file written from it, memory imported for the
+// GPU. Those callers back their range first (mem_thaw before the kernel writes or pins, mem_touch before it reads).
+//
+// NX2NAVI_HEAP_LAZY=0 commits the whole heap at SetHeapSize, as before. On Linux it is off unless set: plat_mem_commit
+// there only makes pages accessible, and the kernel charges a page when it is first touched, so there is nothing to
+// save; with it on, a kernel access to a page nothing has touched fails (EFAULT) as it does on Windows.
+// heap_lock orders the heap's size against these commits. It is taken after lock and before frz_lock, and nothing
+// touches guest memory under it.
+static PlatMutex heap_lock = PLAT_MUTEX_INIT;
+static int heap_lazy = -1;
+
+static int heap_lazy_on(void) {
+    if (heap_lazy < 0) {
+#ifdef _WIN32
+        const char *def = "1";
+#else
+        const char *def = "0";
+#endif
+        const char *e = cfg_get("NX2NAVI_HEAP_LAZY");
+        heap_lazy = strcmp(e && *e ? e : def, "0") != 0;
+        if (heap_lazy)
+            rt_log("memory: the heap's pages are committed when first touched, 2 MiB at a time (NX2NAVI_HEAP_LAZY=0: "
+                   "the whole heap at SetHeapSize)");
+    }
+    return heap_lazy;
+}
+
+// heap_lock held. Commits what is still reserved of the 2 MiB regions [a, a + n) touches, inside the heap; the bytes
+// committed.
+static uint64_t heap_back(uint64_t a, uint64_t n) {
+    uint64_t lo = L.heap.base, hi = lo + heap_size, made = 0;
+    if (a >= hi || a + n <= lo) return 0;
+    // lo and hi are 2 MiB multiples (HEAP_OFF, mem_set_heap_size), so the regions lie inside the heap
+    uint64_t x = a < lo ? lo : a & ~(FRZ_SIZE - 1), end = align_up(a + n < hi ? a + n : hi, FRZ_SIZE);
+    for (uint64_t y; x < end; x = y) {
+        if (plat_mem_state(x, end, &y) != PLAT_MEM_RESERVED) continue;
+        commit(x, y - x, "heap");
+        made += y - x;
+    }
+    return made;
+}
+
+static int in_heap_window(uint64_t a, uint64_t n) {   // may [a, a + n) touch the heap at any size it can have
+    return heap_lazy > 0 && n && a < L.heap.base + HEAP_CAP && a + n > L.heap.base && a + n >= a;
+}
+
+// An access that faulted at a. 1 when it was a reserved page of the heap, which is backed now: the access runs again.
+// A page another thread backed between the fault and here is left to access_fault and thaw_fault, which run an
+// access to a page that is there again.
+static int heap_fault(uint64_t a) {
+    if (!in_heap_window(a, 1)) return 0;
+    plat_mutex_lock(&heap_lock);
+    int ok = a - L.heap.base < heap_size && heap_back(a, 1);
+    plat_mutex_unlock(&heap_lock);
+    return ok;
+}
+
+void mem_touch(uint64_t a, uint64_t n) {
+    if (!in_heap_window(a, n)) return;
+    plat_mutex_lock(&heap_lock);
+    heap_back(a, n);
+    plat_mutex_unlock(&heap_lock);
+}
+
 // The process is re-run when a region is taken: Windows places DLLs, heaps and thread stacks at random addresses,
 // and a fresh process gets a fresh layout.
 static void reexec_or_fail(const char *what) {
@@ -674,6 +754,7 @@ void mem_init(void) {
     // nx2navi.ini is read here, once the address space is claimed and before the first setting: the pool size below
     // depends on NX2NAVI_APP_POOL and on the resolution settings (resolution.c decides them once, on this first call).
     cfg_init();
+    if (heap_lazy_on()) plat_mem_access_hook(access_fault);   // a heap page's first touch is a read as often as a write
     if (cfg_bool("NX2NAVI_WB_PROBE")) {   // a diagnosis: off, no access fault reaches probe_fault and nothing is probed
         plat_mem_access_hook(access_fault);
         __atomic_store_n(&prb_on, 1, __ATOMIC_RELEASE);
@@ -732,10 +813,15 @@ uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
         plat_mutex_unlock(&lock);
         return R_INVALID_STATE;
     }
-    if (size > heap_size) commit(L.heap.base + heap_size, size - heap_size, "heap");
+    // Growing commits nothing when the pages are backed at their first touch (heap_fault). Shrinking gives back
+    // whatever of the range was backed; the fault handler sees the new size before it commits anything there again.
+    int lazy = heap_lazy_on();
+    plat_mutex_lock(&heap_lock);
+    if (size > heap_size && !lazy) commit(L.heap.base + heap_size, size - heap_size, "heap");
     if (size < heap_size) decommit(L.heap.base + size, heap_size - size, "heap");
     heap_size = size;
     __atomic_store_n(&map_gen, map_gen + 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&heap_lock);
     plat_mutex_unlock(&lock);
     if (addr) *addr = L.heap.base;
     return R_OK;

@@ -6097,6 +6097,13 @@ static PlatMutex save_lock = PLAT_MUTEX_INIT;   // one cache save at a time; shu
 // The lock is only ever tried, never waited for: a waiting exclusive request would hold back every new build
 // (a shared request queues behind it), so a pending save could stall the replay. wait_ms: how long to keep trying
 // while builds run (0: one try). Returns 0 when no build-free moment came, 1 otherwise (saved, or nothing to save).
+//
+// The driver writes the data straight into the new file, mapped (plat_file_swap_begin), not into a buffer that is then
+// written out: a buffer the size of the cache was committed for every save, 450 to 560 MB about every 20 s while new
+// pipelines were built, on top of a process that already took the system's commit to its limit. Each save raised
+// the process by 480 to 1490 MB for its length, the commit left fell to 17 MB, and two runs lost the Vulkan device in
+// the middle of a save (their .tmp files stayed behind, cut short). The mapped pages belong to the file and take no
+// commit.
 static int cache_save(uint32_t wait_ms) {
     if (!P.ready || !P.cache || !P.cache_path[0]) return 1;
     // Not under P.lock: holding P.lock through the copy and the file write (about 60 ms on the 1.4.3 fight) stopped
@@ -6118,22 +6125,26 @@ static int cache_save(uint32_t wait_ms) {
         }
         plat_sleep_ms(2);
     }
-    size_t size = 0;
+    size_t size = 0, room = 0;
+    PlatFileSwap *swap = NULL;
     void *data = NULL;
-    int got = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
-              vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS;
+    int sized = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size;
+    if (sized) room = size, data = plat_file_swap_begin(P.cache_path, room, &swap);
+    // With the size just asked for, under the lock that keeps builds out, the second call returns everything. Should a
+    // driver return VK_INCOMPLETE all the same, the file is not replaced.
+    int got = data && vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS && size <= room;
     plat_mutex_unlock(&cache_rw);
     __atomic_sub_fetch(&save_gate, 1, __ATOMIC_RELEASE);
-    if (got) {
-        if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
-        else if (P.feedback) {
-            char when[96];
-            snprintf(when, sizeof when, "at a save of %.1f MB (%+.1f MB since the boot)", size / 1048576.0,
-                     ((double)size - (double)P.cache_loaded) / 1048576.0);
-            fb_log(when);
-        }
+    if (data && !plat_file_swap_end(swap, size, got)) got = 0;
+    if (sized && !got) {
+        static int said;
+        if (!said++) rt_log("vk_pipeline: cannot write %s (%.1f MB)", P.cache_path, room / 1048576.0);
+    } else if (got && P.feedback) {
+        char when[96];
+        snprintf(when, sizeof when, "at a save of %.1f MB (%+.1f MB since the boot)", size / 1048576.0,
+                 ((double)size - (double)P.cache_loaded) / 1048576.0);
+        fb_log(when);
     }
-    free(data);
     plat_mutex_unlock(&save_lock);
     return 1;
 }

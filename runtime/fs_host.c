@@ -1150,6 +1150,7 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     // offset + size without the sum: a size near 2^64 would wrap it below the file's size
     if ((size > id.size || (uint64_t)offset > id.size - size) && !(mode & FS_OPEN_APPEND)) return FS_R_APPEND_REQUIRED;
     if (file->save) save_touched();
+    mem_touch((uintptr_t)buffer, size);   // the kernel's read would fail on a heap page nothing has touched yet
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
         // NX2NAVI_WB_PROBE: the kernel reads the buffer, and a probed page would fail the write instead of faulting
