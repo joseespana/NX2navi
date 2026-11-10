@@ -51,6 +51,7 @@
 #include "vk_gpa.h"
 #include "vk_warm_hint.h"
 
+#define PUSH_METAL_BUFFERS 8   // VkPipe.max_push_buffers on a driver with 31 buffer slots per stage
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
 enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23,
@@ -77,6 +78,12 @@ static struct {
     // set may hold more on a driver that puts it in a Metal argument buffer (MoltenVK: 16 against 1024), so a set whose
     // stage needs more samplers than this is not pushed (push_fits).
     uint32_t max_stage_samplers;
+    // Buffers (uniform, storage, texel) a stage may take from a push set. Metal has 31 buffer slots per stage
+    // (maxPerStageDescriptorStorageBuffers 31 on MoltenVK) and MoltenVK spends some on its own (vertex buffers, buffer
+    // sizes, the argument buffers of the other sets): a compute shader with 18 storage and uniform buffers in a push set
+    // was placed at slots 17 to 34 and refused. On such a driver a set whose stage has more than PUSH_METAL_BUFFERS is
+    // allocated instead (one slot, its argument buffer); elsewhere the limit is 0, no limit.
+    uint32_t max_push_buffers;
     int indep;                         // stage-independent layouts (vk_caps.gpl): vertex set 0, fragment set 1
     int push_stage;                    // GFX_STAGE_* whose set is pushed with independent layouts
     int gpl;                           // draws whose pipeline is building get a fast-linked one (vk_caps.gpl)
@@ -689,6 +696,7 @@ static int ensure_init(void) {
     vkGetPhysicalDeviceProperties2(c->phys, &p2);
     P.max_push = pd.maxPushDescriptors;
     P.max_stage_samplers = p2.properties.limits.maxPerStageDescriptorSamplers;
+    P.max_push_buffers = p2.properties.limits.maxPerStageDescriptorStorageBuffers <= 31 ? PUSH_METAL_BUFFERS : 0;
     P.indep = vk_caps.gpl;
     P.gpl = vk_caps.gpl;
     rt_log(P.gpl ? "vk_pipeline: graphics pipeline library on: a draw whose pipeline is building gets a fast-linked one, "
@@ -2062,11 +2070,21 @@ static int push_fits(const VkDescriptorSetLayoutBinding *b, uint32_t n, int64_t 
                                                 VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_TASK_BIT_EXT,
                                                 VK_SHADER_STAGE_MESH_BIT_EXT};
     for (size_t k = 0; k < sizeof stages / sizeof *stages; k++) {
-        uint64_t samplers = 0;
-        for (uint32_t i = 0; i < n; i++)
-            if ((b[i].stageFlags & stages[k]) && (b[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
-                                                  b[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER))
+        uint64_t samplers = 0, buffers = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!(b[i].stageFlags & stages[k])) continue;
+            VkDescriptorType t = b[i].descriptorType;
+            if (t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || t == VK_DESCRIPTOR_TYPE_SAMPLER)
                 samplers += b[i].descriptorCount;
+            if (t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)
+                buffers += b[i].descriptorCount;
+        }
+        if (P.max_push_buffers && buffers > P.max_push_buffers) {
+            LOG_ONCE("vk_pipeline: a stage with more than %u buffers on a driver with 31 buffer slots: its set is "
+                     "allocated, not pushed", P.max_push_buffers);
+            return 0;
+        }
         if (P.max_stage_samplers && samplers > P.max_stage_samplers) {
             LOG_ONCE("vk_pipeline: a stage with more samplers than maxPerStageDescriptorSamplers (%u): its set is "
                      "allocated, not pushed", P.max_stage_samplers);

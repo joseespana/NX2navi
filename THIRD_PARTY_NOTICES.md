@@ -59,6 +59,7 @@ These tools run on the developer's or player's machine during the build. They ar
 | Tool | Source | License | Purpose |
 |---|---|---|---|
 | hactool (the installer release ships it, see below) | https://github.com/SciresM/hactool @ `1d64a83450e025622f3468c28fc4164dad2c5ef6`, with patches from MacNativeGames | ISC | NCA and update container extraction |
+| MoltenVK (macOS only: KhronosGroup/MoltenVK @ `5189f8de86ec365860f63bf1da736815cfaea5cd` merged with pull request 2842 @ `c516eb423516187204c68cd1ed82fb81520315eb`, VK_EXT_mesh_shader; SPIRV-Cross @ `57e4efcc84112abcd426dc5ec248b5339bee04f2`) | https://github.com/KhronosGroup/MoltenVK, https://github.com/KhronosGroup/SPIRV-Cross | Apache-2.0 | built by `tools/build_moltenvk.py` into `toolchain/moltenvk` (`libMoltenVK.dylib`, its `LICENSE-MoltenVK.txt`), copied into the game folder's `moltenvk/`, which the game's Vulkan loader uses on macOS |
 | Capstone | https://www.capstone-engine.org | BSD-3-Clause | ARM64 disassembly for analysis |
 | Unicorn | https://www.unicorn-engine.org | GPL-2.0 (Python bindings BSD) | Differential testing of the lifter; never linked into the game |
 
