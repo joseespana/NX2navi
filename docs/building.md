@@ -248,9 +248,12 @@ host-visible copy (shadow storage, `runtime/vk_memory.c`): the pages the CPU wro
 writes come back at its fence. Pages both sides write keep a base copy, so each direction moves only its own bytes;
 a VRAM mirror's write-back merge marks the pages it changed, and only those are compared at the fence; a lookup that
 reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue its pool for the copy-in. In Kokiri
-Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
-5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
-well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+Forest (1.1.1, RTX 4090) that cost about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms) before pools read through the
+device address table were kept current, when the foliage was missing. Keeping them current in every part cost about
+8 ms a frame (copy-in 3.4 ms, write-back 4.7 ms). Syncing only pools with new CPU writes, once per guest submission,
+cut copy-in from 4.4 to 2.6 ms a frame on an RX 9070 XT (RADV), at 35.6 fps against 28.3. The copies hold about 5 GB.
+`NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as well:
+the shadow copies are chosen for the measured cost above, not for a missing extension.
 Direct host imports wait for GPU work and completion callbacks, then release their
 buffer and imported memory before returning guest storage; shadow buffers, physical buffers and mirror records retain
 their existing deferred retirement. Shutdown waits for device idle and drains the completion queue before destroying
@@ -258,12 +261,25 @@ the GPA table or memory pools, including retirements waiting for a next submissi
 
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
-the copy-in: a part whose pipelines declare the table is marked at its draws and dispatches, and its prologue brings
-the shadow of every pool in the table up to date with the pages the CPU wrote and queues the same pages for those
-pools' VRAM mirrors (`vk_memory.c` `vk_mem_gpa_sync`). That copies the written pages of every CPU-visible pool in
-each such part, which the cost above does not include. What a shader stores through the table into a shadow copy does
-not come back to guest memory. `--probe-vkmem` checks the read: a shader follows the table to a word of a pool that is
-never bound, and must read `0x13579BDF` and, after a plain CPU write, `0x2468ACE0`. On Linux, run it for each backing:
+the copy-in: a part whose pipelines declare the table is marked at its draws and dispatches, even with reused
+descriptors. Once per guest submission its prologue queries the mapped pools' shared write-watch snapshots, copies
+only pools with newer CPU writes, and queues the same pages for their VRAM mirrors (`runtime/vk_memory.c`
+`vk_mem_gpa_sync`). Without shadow storage, mirrors remain unsynced for the table's readers.
+
+Shaders also write through the table. An imported pool's mirror has a twin in guest memory, but a shadow pool's
+record has no twin there: those writes stayed in the shadow, and a later copy-in could overwrite them with stale
+guest bytes. Kokiri Forest's culling passes kept instance counts and lists that way, and foliage and shadows
+flickered. A store or atomic now marks its page (translator patch `0039`, `runtime/vk_gpa.c` `vk_gpa_written_pages`);
+the first mark appends the page to a ring. The memory code keeps a base copy from guest memory for each reported
+shadow page before copying CPU writes in, and at every part's fence whose shaders write through the table copies
+the GPU's changed bytes back (`runtime/vk_memory.c` `gw_part`, `swb_run`, `merge_page`). Marks stay set until remapping,
+so pages already reported are included at later writing parts too. A byte the CPU changed between the last copy-in
+and the first report can take the shadow's older value once. Earlier Kokiri Forest measurements found 170 pages
+copied back in one part per frame; `NX2NAVI_MEMORY=verify` found 4,760 pages in 30 million missing GPU bytes before,
+and 20 in 41 million after.
+
+`--probe-vkmem` checks the read: a shader follows the table to a word of a pool that is never bound, and must read
+`0x13579BDF` and, after a plain CPU write, `0x2468ACE0`. On Linux, run it for each backing:
 
 ```sh
 for shadow in 0 1; do for memory in import mirror; do
@@ -380,7 +396,7 @@ change passes these, all run with `.venv`:
 | `tests\diff\func.py` | whole functions as the generator emits them, loops, jump tables and calls included (calls go to a stub that checks the registers at the call) | yes |
 | `tests\flags_check.py` | the function-local flag helpers of `runtime\cpu.h` against its packed ones | no |
 | `tests\ds3_check.py` | the DualShock 3 report decoding and output report of `runtime\input_ds3.c` | no |
-| `tests\gpa_check.py` | the device address table of `runtime\vk_gpa.c` as a shader reads it: mapping, mirrors and twins, overlapping imports, and blocks given back and taken again while pool addresses climb (no GPU; any Python) | no |
+| `tests\gpa_check.py` | the device address table of `runtime\vk_gpa.c` as a shader reads it: mapping, mirrors and twins, overlapping imports, block reuse, and written-page marks (deduplication, remapping, delayed entries and ring overflow; no GPU; any Python) | no |
 | `tests\excl_mt.py` | the exclusive monitor helpers under contention and ABA, on several threads | no |
 | `tests\jumptables_check.py` | `recomp/jumptables.py` against a Unicorn oracle; must report 0 disagreements, on 1.4.3 too | yes |
 
