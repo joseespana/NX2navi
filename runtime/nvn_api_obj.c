@@ -539,12 +539,14 @@ static void shader_dump(const prog_t *o, int n, const NVNshaderData *sd) {
     for (int i = 0; i < n; i++) {
         char path[1100];
         snprintf(path, sizeof path, "%s/p%04llu_s%d.ctl", dir, (unsigned long long)o->serial, i);
-        if (sd[i].control) plat_file_write(path, sd[i].control, 0x880);
+        // the kernel reads these for the file: a heap page nothing has touched yet fails the write instead of faulting
+        if (sd[i].control) mem_touch((uintptr_t)sd[i].control, 0x880), plat_file_write(path, sd[i].control, 0x880);
         const pool_t *p = nvn_pool_find(sd[i].data, 1);
         if (p && p->mem && !nvn_gpu_only(sd[i].data)) {
             uint64_t end = (uint64_t)(uintptr_t)p->mem + p->size, len = end - sd[i].data;
             if (len > 0x40000) len = 0x40000;
             snprintf(path, sizeof path, "%s/p%04llu_s%d.code", dir, (unsigned long long)o->serial, i);
+            mem_touch(sd[i].data, len);
             plat_file_write(path, (const void *)(uintptr_t)sd[i].data, (size_t)len);
         }
     }

@@ -449,6 +449,35 @@ static void check_memory(void) {
     mem_query(g->alias.base + g->alias.size + 0x1000, &q);
     CHECK(q.state == 3 && q.base == g->alias.base + g->alias.size, "QueryMemory on host memory");
     CHECK(mem_set_heap_size(0, &heap) == 0, "SetHeapSize 0");
+    // Where the heap's pages are committed at their first touch (memory.c heap_fault): an untouched heap is reserved
+    // and reads zero, a touch backs its 2 MiB region and no other, mem_touch and mem_thaw back a range for the
+    // kernel, and a region given back and asked for again reads zero.
+    uint64_t e = 0, M = 0x200000;
+    CHECK(mem_set_heap_size(4 * M, &heap) == 0, "SetHeapSize 8 MiB");
+    if (plat_mem_state(heap, heap + 4 * M, &e) == PLAT_MEM_RESERVED) {
+        CHECK(e == heap + 4 * M, "part of an untouched heap is committed");
+        CHECK(LD64(heap + M + 0x1238) == 0, "an untouched heap page does not read zero");
+        CHECK(plat_mem_state(heap + M, heap + 4 * M, &e) == PLAT_PROT_RW && e == heap + 2 * M,
+              "a read did not back its 2 MiB region alone");
+        CHECK(plat_mem_state(heap, heap + 4 * M, &e) == PLAT_MEM_RESERVED && e == heap + M,
+              "a read backed the region before its own");
+        ST64(heap + 3 * M - 8, 0x77);
+        CHECK(LD64(heap + 3 * M - 8) == 0x77 && plat_mem_state(heap + 3 * M, heap + 4 * M, &e) == PLAT_MEM_RESERVED,
+              "a write did not back its 2 MiB region alone");
+        mem_touch(heap + M - 0x1000, 0x2000);
+        CHECK(plat_mem_state(heap, heap + 4 * M, &e) == PLAT_PROT_RW && e == heap + 3 * M, "mem_touch did not back its range");
+        mem_thaw(heap + 4 * M - 0x1000, 0x1000);
+        CHECK(plat_mem_state(heap, heap + 4 * M, &e) == PLAT_PROT_RW && e == heap + 4 * M, "mem_thaw did not back its range");
+        ST64(heap + 3 * M + 0x10, 0x55);
+        CHECK(mem_set_heap_size(3 * M, &heap) == 0 && plat_mem_state(heap + 3 * M, heap + 4 * M, &e) == PLAT_MEM_RESERVED,
+              "a smaller heap kept its last region");
+        CHECK(mem_set_heap_size(4 * M, &heap) == 0 && LD64(heap + 3 * M + 0x10) == 0 && LD64(heap + 3 * M - 8) == 0x77,
+              "a heap grown again does not read zero there, or lost what was below");
+        printf("memory: heap pages committed at their first touch\n");
+    } else {
+        printf("memory: the whole heap is committed at SetHeapSize\n");
+    }
+    CHECK(mem_set_heap_size(0, &heap) == 0, "SetHeapSize 0 again");
     printf("memory: heap, physical memory, stack move, QueryMemory, GetInfo: %s\n", failures > before ? "FAIL" : "ok");
 }
 
