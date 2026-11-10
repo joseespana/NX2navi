@@ -251,6 +251,10 @@ reads guest memory itself (the uniform snapshot, `vk_mem_lookup`) does not queue
 Forest (1.1.1, RTX 4090) that costs about 1 ms a frame (copy-in 0.5 ms, write-back 0.6 ms), and the copies hold about
 5 GB. `NX2NAVI_SHADOW=1` turns it on under Windows too. The Steam Deck's RADV has `VK_EXT_external_memory_host` as
 well: the shadow copies are chosen for the measured cost above, not for a missing extension.
+Direct host imports wait for GPU work and completion callbacks, then release their
+buffer and imported memory before returning guest storage; shadow buffers, physical buffers and mirror records retain
+their existing deferred retirement. Shutdown waits for device idle and drains the completion queue before destroying
+the GPA table or memory pools, including retirements waiting for a next submission that was never issued.
 
 The device address table (`runtime/vk_gpa.c`) names a pool's shadow copy as it names an import, so shaders follow guest
 pointers into either. A shader that reads through the table resolves nothing, so the pool it reaches is not queued for
