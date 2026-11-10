@@ -138,7 +138,11 @@ uint64_t plat_cpu_cache_die(uint32_t *l3_kb) {
 
 // macOS has no processor affinity: the scheduler alone places threads, so these report failure and change nothing.
 int plat_process_affinity(uint64_t mask) { (void)mask; return 0; }
-int plat_cpu_reserve(void) { return 0; }
+int plat_cpu_reserve(char *which, size_t size) {
+    if (which && size) which[0] = 0;
+    return 0;
+}
+int plat_cpu_reserve_sweep(void) { return 0; }
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) { (void)t, (void)mask; return 0; }
 
 // tid is the thread's Mach port name (plat_thread_id).
@@ -843,9 +847,10 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 // when the whole host page forbids it. A guest page decommitted beside one still committed is cleared by hand.
 //
 // Write watch: the system has no record of written pages to read and reset, so a watched reservation keeps one bit per
-// host page (dirty). A read-write page whose bit is clear is mapped read-only; the first write to it faults, and the
-// fault handler sets the bit and makes the page writable before the write runs again (watch_fault). plat_mem_written
-// reports the pages whose bit is set and, with reset, clears the bits and maps the pages read-only again. A page just
+// guest page (dirty). A read-write host page is writable only while the bits of all its guest pages are set; otherwise
+// it is mapped read-only, the first write to it faults, and the fault handler sets those bits and makes the page
+// writable before the write runs again (watch_fault). plat_mem_written reports the guest pages whose bit is set and,
+// with reset, clears the bits it reported and maps their host pages read-only again. A page just
 // committed has no write on record, as on the other systems. The kernel does not fault on such a page, it refuses to
 // write into it, so plat_file_pread marks its buffer written first (watch_touch). Writes are recorded per host page
 // (plat_mem_watch_grain): on ARM64 a written host page reports its four guest pages.
@@ -858,7 +863,7 @@ enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are commi
 static uint8_t *pstate;
 static uint64_t hpg;      // the host's page size, once pstate is mapped
 static unsigned hshift;   // its log2
-static uint64_t *dirty;   // a bit per host page below PS_LIMIT: written since the last reset (watched reservations)
+static uint64_t *dirty;   // a bit per guest page below PS_LIMIT: written since the last reset (watched reservations)
 static struct { uint64_t lo, hi; } watch[8];   // the watched reservations; entries below nwatch never change
 static volatile int32_t nwatch;
 static int watch_off = -1;                 // NX2NAVI_WRITE_WATCH=0; -1 before the first reservation
@@ -879,15 +884,26 @@ static int watched(uint64_t a) {
     return 0;
 }
 
-static int dirty_get(uint64_t a) {
-    uint64_t i = a >> hshift;
-    return (int)(__atomic_load_n(&dirty[i >> 6], __ATOMIC_RELAXED) >> (i & 63) & 1);
+// The dirty bits of the guest pages in the host page at h, as a mask in their word of the map (a host page's guest
+// pages are a power of two at most 64, aligned alike, so they share a word).
+static uint64_t dirty_mask(uint64_t h, uint64_t **word) {
+    uint64_t i = h / PG, per = hpg / PG;
+    *word = &dirty[i >> 6];
+    return (per == 64 ? ~0ull : (1ull << per) - 1) << (i & 63);
 }
 
+// Every guest page of the host page at h has a write on record.
+static int dirty_all(uint64_t h) {
+    uint64_t *w, m = dirty_mask(h, &w);
+    return (__atomic_load_n(w, __ATOMIC_RELAXED) & m) == m;
+}
+
+// Sets or clears the bits of every guest page in the host pages of [a, a + n).
 static void dirty_put(uint64_t a, uint64_t n, int on) {
-    for (uint64_t i = a >> hshift, e = (a + n + hpg - 1) >> hshift; i < e; i++) {
-        if (on) __atomic_fetch_or(&dirty[i >> 6], 1ull << (i & 63), __ATOMIC_RELAXED);
-        else __atomic_fetch_and(&dirty[i >> 6], ~(1ull << (i & 63)), __ATOMIC_RELAXED);
+    for (uint64_t h = a & ~(hpg - 1), e = a + n; h < e; h += hpg) {
+        uint64_t *w, m = dirty_mask(h, &w);
+        if (on) __atomic_fetch_or(w, m, __ATOMIC_RELAXED);
+        else __atomic_fetch_and(w, ~m, __ATOMIC_RELAXED);
     }
 }
 
@@ -901,7 +917,7 @@ static int vm_init(void) {
     hpg = (uint64_t)getpagesize();
     hshift = (unsigned)__builtin_ctzll(hpg);
     void *p = mmap(NULL, PS_LIMIT / PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    void *d = mmap(NULL, PS_LIMIT / hpg / 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *d = mmap(NULL, PS_LIMIT / PG / 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED || d == MAP_FAILED) return 0;
     dirty = d;
     pstate = p;
@@ -929,7 +945,7 @@ static int host_apply(uint64_t addr, uint64_t n) {
     watch_take();
     for (uint64_t h = lo; h < hi; h += hpg) {
         uint8_t st = host_state(h);
-        int p = st == PS_RW ? (w && !dirty_get(h) ? PROT_READ : PROT_READ | PROT_WRITE) : st == PS_READ ? PROT_READ
+        int p = st == PS_RW ? (w && !dirty_all(h) ? PROT_READ : PROT_READ | PROT_WRITE) : st == PS_READ ? PROT_READ
               : PROT_NONE;
         if (p == run_prot) continue;
         if (run_prot >= 0 && mprotect((void *)(uintptr_t)run, h - run, run_prot)) ok = 0;
@@ -958,7 +974,7 @@ static int watch_fault(uint64_t addr) {
 static void watch_touch(uint64_t addr, uint64_t n) {
     if (!n || !pstate || addr >= PS_LIMIT || !watched(addr)) return;
     for (uint64_t h = addr & ~(hpg - 1), e = addr + n < PS_LIMIT ? addr + n : PS_LIMIT; h < e; h += hpg)
-        if (!dirty_get(h)) watch_fault(h);
+        if (!dirty_all(h)) watch_fault(h);
 }
 
 static void fault_install(void);
@@ -1087,43 +1103,46 @@ int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs) {
 
 uint64_t plat_mem_watch_grain(void) { return (uint64_t)getpagesize(); }
 
-// A written host page reports its read-write guest pages inside the range. With reset its bit is cleared and it is
-// mapped read-only again, both under the spin lock, so a write lands either before that (and is in the memory the
-// caller reads next) or after it (and faults, setting the bit again). A host page whose guest pages do not all fit
-// into what is left of pages keeps its bit and ends the scan.
+// The watch protects pages here, so a host write over many of them faults page by page unless they are marked first.
+int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
+    if (!n || !pstate || addr >= PS_LIMIT || !watched(addr)) return 0;
+    watch_touch(addr, n);
+    return 1;
+}
+
+// The read-write guest pages of the range whose bit is set, in address order. With reset the bits reported are cleared
+// and their host pages mapped read-only again, both under the spin lock, so a write lands either before that (and is
+// in the memory the caller reads next) or after it (and faults, setting the bits again). When pages is full the scan
+// stops and the pages not reported keep their bits: callers ask again while a call fills their list.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
     if (!max || !n) return 0;
     if (!pstate || addr + n > PS_LIMIT || !watched(addr) || !watched(addr + n - 1)) return UINT64_MAX;
     uint64_t got = 0, end = addr + n;
     plat_mutex_lock(&vm_lock);
-    for (uint64_t h = addr & ~(hpg - 1); h < end;) {
-        uint64_t i = h >> hshift, word = __atomic_load_n(&dirty[i >> 6], __ATOMIC_RELAXED) >> (i & 63);
+    for (uint64_t g = addr & ~(PG - 1); g < end && got < max;) {
+        uint64_t i = g / PG, word = __atomic_load_n(&dirty[i >> 6], __ATOMIC_RELAXED) >> (i & 63);
         if (!word) {   // nothing written up to the end of this word of the map
-            h = ((i | 63) + 1) << hshift;
+            g = ((i | 63) + 1) * PG;
             continue;
         }
         if (!(word & 1)) {
-            h += (uint64_t)__builtin_ctzll(word) << hshift;
+            g += (uint64_t)__builtin_ctzll(word) * PG;
             continue;
         }
-        uint64_t first = got;
-        int full = 0;
-        for (uint64_t g = h < addr ? addr : h; g < h + hpg && g < end; g += PG) {
-            if (pstate[g / PG] != PS_RW) continue;
-            if (got == max) { full = 1; break; }
-            pages[got++] = g;
+        // the set bits of g's host page inside the range, as far as pages has room
+        uint64_t h = g & ~(hpg - 1), he = h + hpg < end ? h + hpg : end, taken = 0;
+        for (; g < he && got < max; g += PG) {
+            uint64_t k = g / PG, bit = 1ull << (k & 63);
+            if (!(__atomic_load_n(&dirty[k >> 6], __ATOMIC_RELAXED) & bit)) continue;
+            if (pstate[k] == PS_RW) pages[got++] = g;
+            taken |= bit;   // a page that is not read-write any more only loses its bit
         }
-        if (full) {
-            got = first ? first : got;   // a first host page that does not fit is reported in part and kept
-            break;
-        }
-        if (reset) {
+        if (reset && taken) {
             watch_take();
-            dirty_put(h, hpg, 0);
+            __atomic_fetch_and(&dirty[(h / PG) >> 6], ~taken, __ATOMIC_RELAXED);
             if (host_state(h) == PS_RW) mprotect((void *)(uintptr_t)h, hpg, PROT_READ);
             watch_give();
         }
-        h += hpg;
     }
     plat_mutex_unlock(&vm_lock);
     return got;
@@ -1852,6 +1871,8 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
 }
 
 int plat_commit_enforced(void) { return 0; }
+int plat_commit_note(char *out, size_t cap) { if (cap) out[0] = 0; return 0; }
+int plat_commit_counts_vram(void) { return 0; }
 
 // ---- child processes
 
