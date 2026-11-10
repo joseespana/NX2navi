@@ -37,17 +37,21 @@ _Static_assert(sizeof(NVNtextureView) == 16, "NVNtextureView is 16 bytes in NX2N
 _Static_assert(offsetof(cmd_t, inline_cur) == 0x20 && offsetof(cmd_t, inline_end) == 0x28, "cmd_t inline fields");
 _Static_assert(RT_GPU_VA_BASE >= RT_ADDRESS_LIMIT, "GPU address window overlaps the guest address space");
 
-// Write watch: a committed heap page and an alias page, written once, are reported once.
+// Write watch: a committed heap page and an alias page, written once, are reported once. A write is recorded for
+// plat_mem_watch_grain bytes: where that is more than a page, the pages of its grain are reported, the first of them
+// first (grain_of), and gp is how many those are.
+static uint64_t grain_of(uint64_t a) { return a & ~(plat_mem_watch_grain() - 1); }
+
 static void check_write_watch(void) {
     const RtGuestLayout *g = mem_layout();
-    uint64_t heap = 0, pages[8], n;
+    uint64_t heap = 0, pages[16], n, gp = plat_mem_watch_grain() / 0x1000;
     CHECK(mem_set_heap_size(0x200000, &heap) == 0 && heap == g->heap.base, "SetHeapSize 2 MiB");
     mem_written_pages(heap, 0x200000, pages, 8);   // drop whatever the commit itself marked
     volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)heap;
     p[0x5000] = 1;
     n = mem_written_pages(heap, 0x200000, pages, 8);
-    CHECK(n == 1 && pages[0] == heap + 0x5000, "heap write: %llu pages reported (want 1 at %#llx)",
-          (unsigned long long)n, (unsigned long long)(heap + 0x5000));
+    CHECK(n == gp && pages[0] == grain_of(heap + 0x5000), "heap write: %llu pages reported (want %llu at %#llx)",
+          (unsigned long long)n, (unsigned long long)gp, (unsigned long long)grain_of(heap + 0x5000));
     printf("write-watch: heap page written once: %llu reported at +%#llx\n", (unsigned long long)n,
            n ? (unsigned long long)(pages[0] - heap) : 0ull);
     n = mem_written_pages(heap, 0x200000, pages, 8);
@@ -56,10 +60,16 @@ static void check_write_watch(void) {
     p[0x7000] = 2;
     p[0x9000] = 3;
     p[0xA000] = 4;
-    n = mem_written_pages(heap, 0x200000, pages, 2);
-    uint64_t m = mem_written_pages(heap, 0x200000, pages + 2, 6);
-    printf("write-watch: three pages written, max 2: %llu then %llu\n", (unsigned long long)n, (unsigned long long)m);
-    CHECK(n == 2 && m == 1, "max 2 reported %llu, then %llu (want 2, 1)", (unsigned long long)n, (unsigned long long)m);
+    // The three writes lie in three grains of 4 KiB and in two of 16 KiB; a call takes two grains, the next the rest.
+    uint64_t grains = 1 + (grain_of(heap + 0x9000) != grain_of(heap + 0x7000)) +
+                      (grain_of(heap + 0xA000) != grain_of(heap + 0x9000));
+    n = mem_written_pages(heap, 0x200000, pages, 2 * gp);
+    uint64_t m = mem_written_pages(heap, 0x200000, pages + 2 * gp, 8);
+    printf("write-watch: three pages written, max %llu: %llu then %llu\n", (unsigned long long)(2 * gp),
+           (unsigned long long)n, (unsigned long long)m);
+    CHECK(n == 2 * gp && m == (grains - 2) * gp, "max %llu reported %llu, then %llu (want %llu, %llu)",
+          (unsigned long long)(2 * gp), (unsigned long long)n, (unsigned long long)m, (unsigned long long)(2 * gp),
+          (unsigned long long)((grains - 2) * gp));
 
     // Frozen region: read-only until the first write thaws it (the write lands and is reported); mem_thaw (a file
     // read) thaws it and holds it thawed; SetHeapSize below decommits it.
@@ -70,7 +80,8 @@ static void check_write_watch(void) {
     p[0x3000] = 7;
     CHECK(!mem_frozen(heap) && p[0x3000] == 7, "a write into a frozen region did not thaw it");
     n = mem_written_pages(heap, 0x200000, pages, 8);
-    CHECK(n == 1 && pages[0] == heap + 0x3000, "write after a thaw: %llu pages reported (want 1)", (unsigned long long)n);
+    CHECK(n == gp && pages[0] == grain_of(heap + 0x3000), "write after a thaw: %llu pages reported (want %llu)",
+          (unsigned long long)n, (unsigned long long)gp);
     CHECK(mem_freeze(heap) == 1, "refreeze after a write thaw");
     mem_thaw(heap + 0x6000, 0x1000);
     CHECK(!mem_frozen(heap) && mem_freeze(heap) == 0, "mem_thaw did not thaw and hold the region");
@@ -82,7 +93,8 @@ static void check_write_watch(void) {
     mem_written_pages(a, 0x4000, pages, 8);
     *(volatile uint8_t *)(uintptr_t)(a + 0x1000) = 1;
     n = mem_written_pages(a, 0x4000, pages, 8);
-    CHECK(n == 1 && pages[0] == a + 0x1000, "alias write: %llu pages reported (want 1)", (unsigned long long)n);
+    CHECK(n == gp && pages[0] == grain_of(a + 0x1000), "alias write: %llu pages reported (want %llu)",
+          (unsigned long long)n, (unsigned long long)gp);
     CHECK(mem_written_pages(a, 0x4000, pages, 8) == 0, "alias: second call reported pages");
 
     // A region with reserved holes freezes its committed pages only, and a write thaws them without committing a hole.

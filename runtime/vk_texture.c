@@ -605,10 +605,14 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearDepthStencilImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
         barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
-    } else if (vk_fix_zero() && !e->bound_to && !e->pub.mirrored && !format_compressed(e->f.vk)) {
+    } else if (vk_fix_zero() && (!e->bound_to || vk_ctx()->image_bytes_apart) && !e->pub.mirrored &&
+               !format_compressed(e->f.vk)) {
         // GPU-only storage that got memory of its own starts at zero, as the pool it stands for (vk_memory.c
         // alloc_physical). Images aliasing pool memory are not cleared: that would erase what other textures rendered
-        // there; mirrored images are uploaded from their storage on first use.
+        // there; mirrored images are uploaded from their storage on first use. Where a bound image's texels are not
+        // the pool's bytes (VkCtx.image_bytes_apart) nothing else is erased, and nothing but this clear zeroes it:
+        // without it the tiles a target's draws leave out showed what the texture's memory held before, as blocks
+        // of noise at the corners of the title menu's text.
         VkClearColorValue zero = {0};
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearColorImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
@@ -2109,7 +2113,8 @@ static int alias_copy(Tex *e, const Tex *src) {
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb,
                            .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
     vkCmdPipelineBarrier2(cb, &di);
-    if (partial && vk_fix_zero() && !e->bound_to && !e->pub.mirrored && !format_compressed(e->f.vk)) {
+    if (partial && vk_fix_zero() && (!e->bound_to || vk_ctx()->image_bytes_apart) && !e->pub.mirrored &&
+        !format_compressed(e->f.vk)) {
         VkClearColorValue zero = {0};
         VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearColorImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);

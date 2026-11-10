@@ -50,6 +50,10 @@ build does: the runtime's *_sdl.* and platform/linux.c take the place of its *_w
 nx2navi.rc, and --msys is not used. VMA_INCLUDE can name the directory holding vk_mem_alloc.h; otherwise the
 system header or the pinned download is used. README-BuildKit.md, "Linux", lists the packages.
 
+On macOS the same again with Apple's clang and linker for the processor of this Mac (ARM64 or x86-64), Homebrew's
+libraries (MoltenVK behind the Vulkan loader, SDL3, Opus, libvpx, dav1d, zstd) and platform/darwin.c; the executable
+finds a library beside it first (rpath @executable_path), and the ARM64 build has no x86-64 level.
+
 Game content is written only to --out; a downloaded VMA header is cached in toolchain/vma, and --make-runtime-lib
 writes DIR. The game folder holds only what this PC built from the player's files: never
 share it. Needs Python 3.10+ with numpy, lz4, zstandard and zbic (pip), with fonttools and pillow too when the kit has
@@ -113,9 +117,15 @@ LIFT_FIXES = [
      '    if (x8) c->tpidr = x8;   /* zero slot: keep the host\'s TLS (make_game.py) */\n'),
 ]
 WIN = os.name == 'nt'
+MAC = sys.platform == 'darwin'
+# macOS: Homebrew's folder for this Mac's processor, and the oldest system the runtime runs on (tools/build_game.py).
+BREW = Path('/opt/homebrew' if os.uname().machine == 'arm64' else '/usr/local') if MAC else None
+MAC_FLAGS = ['-mmacosx-version-min=14.4', '-I', str(BREW / 'include')] if MAC else []
 if WIN:
     LINK_LIBS = ['-lvulkan-1', '-lSDL3', '-lopus', '-lvpx', '-l:libdav1d.a', '-lzstd', '-l:libatomic.a', '-lbcrypt',
                  '-limm32', '-luuid', '-lole32', '-luser32', '-lshell32', '-lgdi32', '-ladvapi32', '-lwinmm']
+elif MAC:   # tools/build_game.py's macOS libraries
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-framework', 'CoreFoundation']
 else:   # tools/build_game.py's Linux libraries, plus dav1d (the AV1 movies) and libatomic
     LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-l:libstdc++.a', '-latomic',
                  '-lm', '-lpthread', '-ldl']
@@ -870,12 +880,15 @@ def compile_all(srcs, cmd_for, cache, jobs, env, progress=None, salt='', stop=No
 
 def runtime_sources():
     """(source, object name) of every runtime file this OS's build compiles: the Win32 files on Windows, the SDL
-    window's (*_sdl.*) and platform/linux.c elsewhere (tools/build_game.py's foreign_os)."""
+    window's (*_sdl.*) elsewhere with platform/linux.c or, on macOS, platform/darwin.c (tools/build_game.py's
+    other_os)."""
+    foreign = {'win32.c', 'linux.c' if MAC else 'darwin.c'}
     rt = KIT / 'runtime'
     out = []
     for pat in RUNTIME_PATTERNS:
         for p in sorted(rt.glob(pat)):
-            if (p.stem.endswith('_sdl') or p.name == 'linux.c') if WIN else (p.stem.endswith('_win') or p.name == 'win32.c'):
+            if (p.stem.endswith('_sdl') or p.name in ('linux.c', 'darwin.c')) if WIN else \
+                    (p.stem.endswith('_win') or p.name in foreign):
                 continue
             out.append((p, 'rt_' + p.relative_to(rt).as_posix().replace('/', '_').rsplit('.', 1)[0] + '.o'))
     return out
@@ -975,7 +988,7 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None):
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
         return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
-                *march, '-fno-strict-aliasing', '-w', *declspec, *inc, '-o', str(dst), str(src)]
+                *march, '-fno-strict-aliasing', '-w', *declspec, *MAC_FLAGS, *inc, '-o', str(dst), str(src)]
     return cmd_for
 
 
@@ -1005,10 +1018,17 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     lib.unlink(missing_ok=True)
     rsp = dest / 'ar.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for _, o in srcs), encoding='utf-8')
-    ar = os.environ.get('NX2NAVI_AR') or (str(msys / 'bin' / 'ar.exe') if WIN else shutil.which('ar'))
-    if not ar:
-        fail('ar is not on PATH: install binutils or set NX2NAVI_AR')
-    if subprocess.run([ar, 'rcs', str(lib), '@' + str(rsp)], env=env).returncode:
+    if MAC:   # Apple's ar reads no response file; its libtool takes a list of files, one path a line
+        rsp.write_text('\n'.join(str(o) for _, o in srcs), encoding='utf-8')
+        if subprocess.run(['libtool', '-static', '-no_warning_for_no_symbols', '-o', str(lib), '-filelist', str(rsp)],
+                          env=env).returncode:
+            fail('the runtime library could not be archived')
+        ar = None
+    else:
+        ar = os.environ.get('NX2NAVI_AR') or (str(msys / 'bin' / 'ar.exe') if WIN else shutil.which('ar'))
+        if not ar:
+            fail('ar is not on PATH: install binutils or set NX2NAVI_AR')
+    if ar and subprocess.run([ar, 'rcs', str(lib), '@' + str(rsp)], env=env).returncode:
         fail('the runtime library could not be archived')
     meta = {'runtime': runtime_digest(), 'compiler': clang_version(clang, env),
             'objects': sorted(o.name for _, o in srcs)}
@@ -1131,7 +1151,7 @@ def toolchain(msys):
     if WIN:
         return (msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe',
                 dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', '')), msys / 'include' / 'vma')
-    for tool in ('clang', 'clang++', 'ld.lld'):
+    for tool in ('clang', 'clang++') + (() if MAC else ('ld.lld',)):   # macOS links with Apple's linker
         if not shutil.which(tool):
             fail(f'{tool} is not on PATH: install the packages README-BuildKit.md lists under "Linux"')
     if os.environ.get('VMA_INCLUDE'):
@@ -1287,11 +1307,15 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     # 16 MiB for the main thread with either linker (GNU ld takes the same flag): the default 2 MiB is too little
     if WIN:
         ld = (['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []) + ['-Wl,--stack,16777216']
+    elif MAC:   # tools/build_game.py's macOS flags; the program runs on a thread of its own there (runtime/main.c)
+        ld = ['-mmacosx-version-min=14.4', '-Wl,-rpath,@executable_path', '-L', str(BREW / 'lib')]
     else:   # tools/build_game.py's Linux flags; the main thread's stack is the process's (ulimit -s), not the linker's
         ld = (['-fuse-ld=lld'] if shutil.which('ld.lld') else []) + ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
     # the link map feeds tools/prof_report.py (symbols for an NX2NAVI_PROFILE sampling profile); both linkers write one
-    ld.append('-Wl,--Map=' + (cache_dir / 'ocarina.map').as_posix())
-    lib = ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive'] if prebuilt else []
+    ld += ['-Xlinker', '-map', '-Xlinker', (cache_dir / 'ocarina.map').as_posix()] if MAC else \
+        ['-Wl,--Map=' + (cache_dir / 'ocarina.map').as_posix()]
+    lib = [] if not prebuilt else ['-Wl,-force_load,' + str(prebuilt[0])] if MAC else \
+        ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive']
     stamp = [[o.name, o.stat().st_size, o.stat().st_mtime_ns] for o in objs]
     if prebuilt:
         stamp.append([prebuilt[0].name, prebuilt[0].stat().st_size, sha256_file(prebuilt[0])])
@@ -1606,6 +1630,14 @@ def keep_awake():
     the pipe this process holds open, so the lock also goes when this process is killed. Without systemd-inhibit (or a
     login manager to take the lock) nothing happens."""
     global AWAKE
+    if MAC:   # caffeinate holds the system awake until this process is gone
+        if AWAKE is None:
+            try:
+                AWAKE = subprocess.Popen(['caffeinate', '-i', '-w', str(os.getpid())], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                pass
+        return
     if os.name != 'nt':
         if AWAKE is None:
             try:
@@ -1777,7 +1809,7 @@ def main():
             if not (msys / need).exists():
                 fail(f'{msys / need} is missing: install MSYS2 and the packages README-BuildKit.md lists')
     else:
-        for tool in ('clang', 'clang++', 'ld.lld'):
+        for tool in ('clang', 'clang++') + (() if MAC else ('ld.lld',)):
             if not shutil.which(tool):
                 fail(f'{tool} is not on PATH: install the packages README-BuildKit.md lists under "Linux"')
     packages = {'numpy': 'numpy', 'lz4': 'lz4', **({} if a.rebuild else {'zbic': 'zbic'}),

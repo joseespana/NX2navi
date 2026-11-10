@@ -44,7 +44,14 @@ static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0,
 static inline uint64_t rt_get_fpsr(void) { uint64_t v; __asm__ volatile("mrs %0, fpsr" : "=r"(v)); return v; }
 static inline void rt_set_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
 static inline void rt_set_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" :: "r"(v)); }
-static inline void rt_fpcr_sync(const Cpu *c) { (void)c; }
+// Code lifted with --simd=c keeps FPCR in the Cpu, as on x86-64 below, and the host's FPCR of a thread running it
+// mirrors c->fpcr the same way: flush-to-zero (bit 24) as the guest's, rounding to nearest (bits 22-23; FPCR.RMode
+// takes the slow paths of runtime/simd.h), and the default-NaN mode (bit 25) off, since the lowering applies FPCR.DN
+// itself.
+static inline void rt_fpcr_sync(const Cpu *c) {
+    uint64_t cur = rt_get_fpcr(), want = (cur & ~0x3C00000ull) | (c->fpcr & (1u << 24));
+    if (cur != want) rt_set_fpcr(want);
+}
 #else
 // Host FP state is not the guest's here: code lifted with --simd=c keeps FPCR/FPSR in Cpu (c->fpcr, zeroed
 // with the Cpu), so the host-side reset in thread start-up has nothing to do.
@@ -354,8 +361,7 @@ static inline uint32_t sdiv32(uint32_t a, uint32_t b) {
     return (uint32_t)((int32_t)a / (int32_t)b);
 }
 
-// Portable FP/SIMD helpers for code lifted with --simd=c (default off AArch64; gen.py includes simd.h itself
-// in that mode, so AArch64 hosts can build it too).
-#if !defined(__cplusplus) && !defined(__aarch64__)
+// Portable FP/SIMD helpers for code lifted with --simd=c, the lowering the generator uses on every host.
+#if !defined(__cplusplus)
 #include "simd.h"
 #endif

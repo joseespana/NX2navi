@@ -5,12 +5,16 @@
 // first quiet NaN), FPCR.DN default NaN, FPCR.FZ flushing (inputs and pre-rounding-tiny results), FPCR.RMode
 // for arithmetic / conversions / FRINTX/I, saturating FP->int conversions, fused multiply-add, ARM estimate
 // tables. Not modelled: FPSR cumulative exception bits and QC, FPCR trap enables, FP16 arithmetic (ARMv8.2).
-// FPCR.AHP is honoured by the half-precision conversions. Host assumptions: IEEE binary32/64, MXCSR in
-// round-to-nearest outside the slow paths, with FTZ|DAZ equal to FPCR.FZ (cpu.h rt_fpcr_sync keeps it so); fma must be
-// correctly rounded: -march=x86-64-v3 has the FMA instruction, and the v2 build links runtime/fma.c for it.
+// FPCR.AHP is honoured by the half-precision conversions. Host assumptions: IEEE binary32/64, the host's FP control
+// register (MXCSR on x86-64, FPCR on ARM64) in round-to-nearest outside the slow paths, with its flush-to-zero equal to
+// FPCR.FZ (cpu.h rt_fpcr_sync keeps it so; on ARM64 it also keeps the host's default-NaN mode off, as the lowering
+// applies FPCR.DN itself); fma must be correctly rounded: -march=x86-64-v3 and ARM64 have the instruction, and the v2
+// build links runtime/fma.c for it.
 #pragma once
 #include <fenv.h>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 #include <math.h>
 
 #include "cpu.h"
@@ -211,26 +215,41 @@ SI int simd_fe_mode(uint64_t fpcr) {
     return m[(fpcr >> 22) & 3];
 }
 
-// MXCSR rounding control (bits 13-14) without fesetround's x87 + SSE double write; ldmxcsr only on change.
+// The host's rounding control without fesetround (on x86-64 that writes the x87 word and MXCSR both); the register is
+// written only on change. x86-64: MXCSR bits 13-14 (nearest 00, down 01, up 10, toward zero 11). ARM64: FPCR bits
+// 22-23, the guest's own RMode field.
+#if defined(__x86_64__)
 #define SIMD_RC_MASK 0x6000u
+#define SIMD_RC_RZ 0x6000u
+SI unsigned simd_fpc_get(void) { return _mm_getcsr(); }
+SI void simd_fpc_set(unsigned v) { _mm_setcsr(v); }
+// FPCR.RMode (RN 00, RP 01, RM 10, RZ 11) as the host's rounding control bits.
+SI unsigned simd_rc_of(uint64_t fpcr) {
+    static const unsigned rc[4] = {0x0000u, 0x4000u, 0x2000u, 0x6000u};
+    return rc[(fpcr >> 22) & 3];
+}
+#else
+#define SIMD_RC_MASK 0xC00000u
+#define SIMD_RC_RZ 0xC00000u
+SI unsigned simd_fpc_get(void) { return (unsigned)rt_get_fpcr(); }
+SI void simd_fpc_set(unsigned v) { rt_set_fpcr(v); }
+SI unsigned simd_rc_of(uint64_t fpcr) { return (unsigned)fpcr & SIMD_RC_MASK; }
+#endif
 SI unsigned simd_rm_set_rc(unsigned cur, unsigned rc) {
-    if ((cur & SIMD_RC_MASK) != rc) _mm_setcsr((cur & ~SIMD_RC_MASK) | rc);
+    if ((cur & SIMD_RC_MASK) != rc) simd_fpc_set((cur & ~SIMD_RC_MASK) | rc);
     return cur;
 }
-// Set MXCSR RC from FPCR.RMode (RN 00, RP 10, RM 01, RZ 11); returns the previous MXCSR.
-SI unsigned simd_rm_enter(uint64_t fpcr) {
-    static const unsigned rc[4] = {0x0000u, 0x4000u, 0x2000u, 0x6000u};
-    return simd_rm_set_rc(_mm_getcsr(), rc[(fpcr >> 22) & 3]);
-}
+// Set the host's rounding control from FPCR.RMode; returns the previous control register.
+SI unsigned simd_rm_enter(uint64_t fpcr) { return simd_rm_set_rc(simd_fpc_get(), simd_rc_of(fpcr)); }
 // Force toward-zero.
-SI void simd_rm_rz(void) { simd_rm_set_rc(_mm_getcsr(), 0x6000u); }
-// Restore the MXCSR saved by simd_rm_enter, only if it changed.
+SI void simd_rm_rz(void) { simd_rm_set_rc(simd_fpc_get(), SIMD_RC_RZ); }
+// Restore the control register saved by simd_rm_enter, only if it changed.
 SI void simd_rm_leave(unsigned old) {
-    unsigned cur = _mm_getcsr();
-    if ((cur & SIMD_RC_MASK) != (old & SIMD_RC_MASK)) _mm_setcsr((cur & ~SIMD_RC_MASK) | (old & SIMD_RC_MASK));
+    unsigned cur = simd_fpc_get();
+    if ((cur & SIMD_RC_MASK) != (old & SIMD_RC_MASK)) simd_fpc_set((cur & ~SIMD_RC_MASK) | (old & SIMD_RC_MASK));
 }
 
-// The thread's MXCSR mirrors the guest FPCR.FZ with RC = nearest whenever guest code runs (cpu.h rt_fpcr_sync), so
+// The thread's FP control register mirrors the guest FPCR.FZ with RC = nearest whenever guest code runs (cpu.h rt_fpcr_sync), so
 // plain host FP gives the ARM result unless FPCR.RMode asks for directed rounding, which the slow paths handle.
 SI int simd_directed(const Cpu *c) { return __builtin_expect((c->fpcr & FPCR_RM) != 0, 0); }
 

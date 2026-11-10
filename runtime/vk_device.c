@@ -103,7 +103,7 @@ static int create_instance(void) {
 #ifdef __linux__
     nvidia_cache_beside_exe();
 #endif
-    const char *ext[12];
+    const char *ext[13];
     uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     int validate = cfg_bool("NX2NAVI_VK_VALIDATION");
@@ -123,6 +123,13 @@ static int create_instance(void) {
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
+    // A driver that implements Vulkan on another graphics API, short of full conformance (MoltenVK on macOS), is
+    // listed only to an instance that asks for such drivers.
+    if (instance_ext_present(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        ext[n_ext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        ci.enabledExtensionCount = n_ext;
+        ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
     rdoc_init();
     VkResult r = vk_dlssg_create_instance(&ci, &g_vk.instance);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateInstance failed (%d); is a Vulkan 1.3 driver installed?", (int)r); return 0; }
@@ -290,6 +297,10 @@ static int create_device(void) {
     CHAIN(clip, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT);
 #define OPTIONAL_EXT(flag, name, member, stype) do { \
         if (has_ext(ep, ne, name)) { g_vk.flag = 1; ext[n_ext++] = name; CHAIN(member, stype); } } while (0)
+    // Such a driver's device must be created with this extension when it has it.
+    int subset = has_ext(ep, ne, "VK_KHR_portability_subset");
+    if (subset) ext[n_ext++] = "VK_KHR_portability_subset";
+    g_vk.image_bytes_apart = subset;
     OPTIONAL_EXT(has_custom_border_color, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, cbc, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
     OPTIONAL_EXT(has_eds, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, eds, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT);
     OPTIONAL_EXT(has_eds2, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, eds2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT);
@@ -397,9 +408,12 @@ static int create_device(void) {
     else if (!h->shaderInt64) miss = "shaderInt64";
     else if (!h->samplerAnisotropy) miss = "samplerAnisotropy";
     else if (!h->independentBlend) miss = "independentBlend";
-    else if (!h->geometryShader) miss = "geometryShader";
+    // Vulkan on Metal has no geometry stage. The back end builds no pipeline with one, so such a driver is let
+    // through; whether a translated shader still needs the feature for something else is not known yet.
+    else if (!h->geometryShader && !subset) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    if (!h->geometryShader) rt_log("vk: no geometry shaders on %s (a portability driver): going on without", g_vk.props.deviceName);
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;
     if (g_vk.has_vrs) {   // the rate is set per draw; no rate attachment and no per-primitive rates
         c->vrs.attachmentFragmentShadingRate = c->vrs.primitiveFragmentShadingRate = VK_FALSE;

@@ -54,9 +54,11 @@ def main():
     if os.name == 'nt' and MSYS_BIN.exists():
         env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
     rt = ROOT / 'runtime'
-    plat = ['platform/win32.c', 'platform/common.c'] if os.name == 'nt' else ['platform/linux.c', 'platform/common.c']
+    mac = sys.platform == 'darwin'
+    plat = ['platform/win32.c', 'platform/common.c'] if os.name == 'nt' else \
+        ['platform/darwin.c' if mac else 'platform/linux.c', 'platform/common.c']
     libs = ['-lbcrypt', '-lwinmm', '-lpsapi', '-lshell32', '-lole32', '-luser32'] if os.name == 'nt' else \
-        ['-lpthread', '-ldl', '-lm']
+        ['-framework', 'CoreFoundation'] if mac else ['-lpthread', '-ldl', '-lm']
     subprocess.check_call([compiler(), '-std=gnu11', '-O1', '-g', '-w', '-I', str(rt), str(ROOT / 'tests' /
                            'save_share_check.c'), *(str(rt / f) for f in ('fs_host.c', 'save_share.c', 'save_zip.c',
                                                                            *plat)), '-o', str(exe), *libs], env=env)

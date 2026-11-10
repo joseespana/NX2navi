@@ -8,6 +8,11 @@ runtime's *_sdl.* and platform/linux.c take the place of its *_win.*, platform/w
 the system's (Vulkan, SDL3, Opus, libvpx, zstd; libstdc++ static), and the executable finds a libSDL3.so.0 beside it
 first (rpath $ORIGIN). docs/building.md lists the packages.
 
+On macOS the same again with Apple's clang and linker and platform/darwin.c: --arch arm64 or x86_64 (default: the
+host's) names the architecture, the libraries and headers are Homebrew's (/opt/homebrew for ARM64, /usr/local for
+x86-64; Vulkan is its loader with MoltenVK), and the executable finds a libSDL3 beside it first (rpath
+@executable_path). The ARM64 build has no CPU level: --cpu applies to x86-64 only.
+
     .venv\\Scripts\\python tools\\build_game.py                     # generated/v121 -> build/v121/nx2navi.exe
     .venv\\Scripts\\python tools\\build_game.py --modules subsdk0   # one module (links if it has no calls into others)
     .venv\\Scripts\\python tools\\build_game.py --jobs 8
@@ -61,6 +66,7 @@ import ctypes.wintypes as wt   # the job-object structures below; importing it w
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -74,6 +80,8 @@ import build_shaders
 from check_content import GENERATED_MARKER
 
 WIN = os.name == 'nt'
+MAC = sys.platform == 'darwin'
+ARM64 = platform.machine().lower() in ('arm64', 'aarch64')   # the target's architecture; macOS: set_arch (--arch)
 if not WIN:
     import resource
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,6 +113,10 @@ RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
 def set_cpu(cpu):
     """Target x86-64-v3 (the default) or x86-64-v2. RT_CPU_LEVEL lets runtime/main.c's self-test check the same
     instruction set the build was compiled for."""
+    if ARM64:   # no levels: the lifted FP/SIMD runs as the guest's own instructions
+        for flags in (GEN_FLAGS, RT_FLAGS):
+            flags[:] = [f for f in flags if not f.startswith('-march=x86-64')]
+        return
     march = f'-march=x86-64-{cpu}'
     GEN_FLAGS[GEN_FLAGS.index('-march=x86-64-v3')] = march
     RT_FLAGS[RT_FLAGS.index('-march=x86-64-v3')] = march
@@ -147,6 +159,12 @@ if WIN:
     LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Xlinker', '"--Map=$builddir/nx2navi.map"']   # the map feeds tools/prof_report.py
     LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lole32', '-lshell32', '-luuid', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libzstd.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx static (movies); libzstd static (resolution.c)
     VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
+elif MAC:
+    # Apple's linker. @executable_path: a libSDL3 next to nx2navi comes before Homebrew's. -Xlinker passes the map path
+    # as one argument, as on Windows. set_arch adds the architecture and Homebrew's directories.
+    LINK_FLAGS = ["'-Wl,-rpath,@executable_path'", '-Xlinker', '-map', '-Xlinker', '"$builddir/nx2navi.map"']
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-lc++', '-framework', 'CoreFoundation']
+    VMA_INCLUDE = Path('/opt/homebrew/include')   # vk_mem_alloc.h; Homebrew has no package of it, so it is fetched
 else:
     # -no-pie: the lifted modules' function tables (hundreds of thousands of pointers) need no load-time relocation.
     # $ORIGIN: a libSDL3.so.0 next to nx2navi comes before the system's (the release's portable folder).
@@ -180,6 +198,32 @@ def vma_include():
     return VMA_LOCAL
 
 
+MAC_MIN = '14.4'   # the oldest macOS the runtime runs on (platform/darwin.c: os_sync_wait_on_address)
+
+
+def set_arch(arch):
+    """macOS: build for arch ('arm64' or 'x86_64'; None: the host's) against the Homebrew of that architecture. Its
+    headers serve the other architecture too, so a machine with one Homebrew still compiles both; the link then needs
+    the libraries of the target."""
+    global ARM64
+    if arch:
+        ARM64 = arch == 'arm64'
+    arch = 'arm64' if ARM64 else 'x86_64'
+    brew = Path('/opt/homebrew' if ARM64 else '/usr/local')
+    inc = brew / 'include'
+    if not (inc / 'vulkan' / 'vulkan.h').is_file():
+        other = Path('/usr/local' if ARM64 else '/opt/homebrew') / 'include'
+        if (other / 'vulkan' / 'vulkan.h').is_file():
+            print(f'build_game: no Vulkan headers in {inc}; compiling against {other} (the link needs the {arch} '
+                  f'libraries in {brew / "lib"})', file=sys.stderr)
+            inc = other
+    target = ['-arch', arch, f'-mmacosx-version-min={MAC_MIN}']
+    GEN_FLAGS[:0] = target
+    # -fdeclspec: the FidelityFX API header marks its entry points __declspec(dllexport) on every system
+    RT_FLAGS[:0] = target + ['-fdeclspec', '-I', cmd_path(inc)]
+    LINK_FLAGS[:0] = target + ['-L', cmd_path(brew / 'lib')]
+
+
 # --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
 LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lole32', '-lshell32', '-luuid', '-lvulkan-1', '-lSDL3', '-lopus',
                   '-l:libvpx.a', '-l:libzstd.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
@@ -189,7 +233,7 @@ DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 # functions sit on it). mouse_direct.c also registers host callbacks relative to that version's patch page.
 INSTALL_SIDE = {'romfs.c', 'patches.c', 'ov_zstd.c', 'mouse_direct.c'}
 LIB_NAME = 'libnx2navirt.a'
-AR = UCRT / 'llvm-ar.exe' if WIN else on_path('llvm-ar')
+AR = UCRT / 'llvm-ar.exe' if WIN else on_path('ar' if MAC else 'llvm-ar')
 WINDRES = UCRT / 'windres.exe'   # runtime/nx2navi.rc: the manifest of nx2navi.exe
 # GNU windres runs its preprocessor through cmd.exe, and left to find it names the gcc beside it by full path: once that
 # path and the .rc's both hold a space, cmd.exe drops the outer quotes and splits the command at the first space. gcc by
@@ -310,11 +354,11 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 def other_os(name):
     """A runtime file for another OS: Win32 ones (*_win.*, platform/win32.c, nx2navi.rc) off Windows, the SDL window's
-    (*_sdl.*) and platform/linux.c on Windows."""
+    (*_sdl.*) on Windows, and the platform/linux.c or platform/darwin.c of the other systems."""
     stem = name.rsplit('.', 1)[0]
     if WIN:
-        return stem.endswith('_sdl') or name == 'linux.c'
-    return stem.endswith('_win') or name in ('win32.c', 'nx2navi.rc')
+        return stem.endswith('_sdl') or name in ('linux.c', 'darwin.c')
+    return stem.endswith('_win') or name in ('win32.c', 'nx2navi.rc', 'linux.c' if MAC else 'darwin.c')
 
 
 def runtime_sources(skip=()):
@@ -446,6 +490,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
                          f'{ninja_path(RUNTIME / "nx2navi.ico")}')
         else:
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}{pgo_dep}')
+            if MAC and src.suffix == '.cpp':   # Apple's clang defaults to C++98
+                lines.append('  rtflags = $rtflags -std=gnu++17')
         rt.append(o)
     objs['runtime'] = rt
     every = [o for v in objs.values() for o in v]
@@ -460,8 +506,10 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         # Whole archive: the runtime's weak defaults (nvn_procs.c, nvn_api_core.c, vk_sync.c) would otherwise satisfy
         # references before the linker pulls the members with the strong definitions, which would stay out of nx2navi.exe.
         rule = 'link_lib'
+        whole = f'-Wl,-force_load,{cmd_path(runtime_lib)}' if MAC else \
+            f'-Wl,--whole-archive {cmd_path(runtime_lib)} -Wl,--no-whole-archive'
         lines += ['', 'rule link_lib',
-                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {cmd_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
+                  f'  command = $cc $ldflags @$out.rsp {whole} $libs -o $out',
                   '  rspfile = $out.rsp', '  rspfile_content = $in_newline', '  description = LINK $out']
     lines += ['', f'build {ninja_path(exe)}: {rule} ' + ' '.join(ninja_path(o) for o in every) +
               (f' | {ninja_path(runtime_lib)}' if runtime_lib else ''),
@@ -669,7 +717,7 @@ def run_measured(cmd, env):
     if not WIN:
         t0 = time.monotonic()
         code = subprocess.call(cmd, cwd=ROOT, env=env)
-        peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024   # KiB on Linux
+        peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * (1 if MAC else 1024)   # KiB on Linux, bytes on macOS
         return code, time.monotonic() - t0, peak, 0
     k32 = ctypes.WinDLL('kernel32', use_last_error=True)
     k32.CreateJobObjectW.restype = wt.HANDLE
@@ -774,6 +822,7 @@ def main():
     ap.add_argument('--version', default='v121', help='game version (default v121)')
     ap.add_argument('--cpu', choices=('v2', 'v3'), default='v3',
                     help='target CPU level: v3 (AVX2/FMA, default) or v2 (SSE4.2, for older CPUs; slower)')
+    ap.add_argument('--arch', choices=('arm64', 'x86_64'), help="macOS: the architecture to build for (default: the host's)")
     ap.add_argument('--gen', type=Path, help='generated C directory (default generated/<version>)')
     ap.add_argument('--out', type=Path, help='build directory (default build/<version>)')
     ap.add_argument('--modules', help='comma-separated subset of the layout modules (default all)')
@@ -815,6 +864,10 @@ def main():
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     args = ap.parse_args()
+    if MAC:
+        set_arch(args.arch)
+    elif args.arch:
+        sys.exit('--arch is for macOS builds')
     set_cpu(args.cpu)
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()
@@ -969,6 +1022,9 @@ def main():
         return
     for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to nx2navi.exe
         shutil.copy2(dll, exe.parent / dll.name)
+    if MAC:
+        print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}')
+        return
     sections, image = pe_sections(exe) if WIN else elf_sections(exe)
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))

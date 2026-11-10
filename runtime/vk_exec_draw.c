@@ -12,6 +12,7 @@
 //
 // Unbound vertex streams read a zeroed buffer. The support buffer layout is the translator's SupportBuffer.
 // Contains code Copyright (c) 2026 jhaizhou, Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -3666,6 +3667,16 @@ static struct {
     uint64_t e_draws, e_pipe, e_dyn, e_push, e_pushw, e_sets, e_vb, e_setw, e_setreuse;   // emitted commands (summary)
 } MO;
 
+// The clock of MO.cyc: the processor's cycle counter on x86-64, nanoseconds elsewhere (reading the cycle counter is
+// privileged on ARM64).
+static inline uint64_t mo_ticks(void) {
+#if defined(__x86_64__)
+    return __builtin_ia32_rdtsc();
+#else
+    return plat_now_ns();
+#endif
+}
+
 // The motion draws of the frame, kept as a list while the scene replays and recorded into the replay's own command
 // buffer by vk_mvobj_execute, through the recorder thread (vk_rec.h) like every other draw: recording them straight
 // into a secondary command buffer made the driver's work for each one on the replay thread. What a draw shares with
@@ -4028,15 +4039,15 @@ static int mo_prev_block(int index, const p_bind_buf *u, VkDescriptorBufferInfo 
         skip = e && *e ? strtol(e, NULL, 16) : 1L << 9 | 1L << 11;
     }
     if (skip >> (index + 3) & 1) return 0;
-    uint64_t c0 = __builtin_ia32_rdtsc();
+    uint64_t c0 = mo_ticks();
     int found = vk_mvprev_find(index, u->addr, u->size, &pa, &how);
-    uint64_t c1 = __builtin_ia32_rdtsc();
+    uint64_t c1 = mo_ticks();
     MO.cyc[0] += c1 - c0, MO.ncyc++, MO.big += n;
     if (index >= 0 && index < 14) MO.lk[index][found ? how : MVPREV_NONE]++;
     if (!found || !vk_usnap_find(pa, n, LIM.ubo_align, out)) return 0;
     if (how == MVPREV_SELF) return 1;   // bound at the same address last frame: not written again
     const uint8_t *map = vk_usnap_map(), *cur = vk_usnap_bytes(u->addr, n);
-    uint64_t c2 = __builtin_ia32_rdtsc();
+    uint64_t c2 = mo_ticks();
     MO.cyc[1] += c2 - c1;
     if (!cur) return 0;
     const uint8_t *old = map + out->offset;
@@ -4050,7 +4061,7 @@ static int mo_prev_block(int index, const p_bind_buf *u, VkDescriptorBufferInfo 
         return 1;
     }
     int r = mo_similar(cur, old, n, changed);
-    MO.cyc[2] += __builtin_ia32_rdtsc() - c2;
+    MO.cyc[2] += mo_ticks() - c2;
     if (!r && index >= 0 && index < 14) MO.lk[index][4]++;
     return r;
 }

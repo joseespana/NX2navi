@@ -20,6 +20,13 @@ __attribute__((section(".ovr$a"), used)) static const RtHostEntry ovr_start[1];
 __attribute__((section(".ovr$z"), used)) static const RtHostEntry ovr_stop[1];
 __attribute__((section(".obs$a"), used)) static const RtHostEntry obs_start[1];
 __attribute__((section(".obs$z"), used)) static const RtHostEntry obs_stop[1];
+#elif defined(__APPLE__)
+// Mach-O: the linker defines section$start$<segment>$<section> and section$end$... around a section, and makes an
+// empty one for a build without observers.
+extern const RtHostEntry ovr_start[] __asm__("section$start$__DATA$nx2navi_ovr");
+extern const RtHostEntry ovr_stop[] __asm__("section$end$__DATA$nx2navi_ovr");
+extern const RtHostEntry obs_start[] __asm__("section$start$__DATA$nx2navi_obs");
+extern const RtHostEntry obs_stop[] __asm__("section$end$__DATA$nx2navi_obs");
 #else
 // ELF: the linker defines __start_<section> and __stop_<section> around a section named like a C identifier. Weak: a
 // build without observers has no such section, and both bounds are then NULL.

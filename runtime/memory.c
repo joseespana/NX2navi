@@ -26,7 +26,7 @@
 #define HEAP_CAP (12 * GiB)        // heap region: a Switch 2 application pool is 9809 MiB (the 12 GB console arrangement)
 #define ALIAS_SIZE (64 * GiB)
 #define ALIAS_ALIGN (4 * GiB)
-#define ALIAS_PAGES (ALIAS_SIZE / PAGE)
+#define ALIAS_MIN (12 * GiB)       // the compact layout's least alias region (mem_init): room to map a whole Switch 2 pool
 #define DEFAULT_POOL rt_app_pool_bytes  // retail application pool of the title (generated: NX2NAVI 0xCD500000, Switch 2 9809 MiB)
 #define SYSTEM_RESOURCE_BUDGET (32ull << 20)
 #define MAX_STACK_MAPS 4096
@@ -47,6 +47,9 @@ enum { ATTR_PERMISSION_LOCKED = 16 };
 
 static RtGuestLayout L;
 static uint64_t mods_lo, mods_hi;   // fixed module window
+// The alias region as mem_init reserved it: smaller than ALIAS_SIZE in the compact layout.
+static uint64_t alias_size = ALIAS_SIZE;
+static const uint64_t low_size = LOW_SIZE, heap_cap = HEAP_CAP;
 static PlatMutex lock = PLAT_MUTEX_INIT;
 static uint64_t heap_size, alias_bytes;
 static uint8_t *alias_pages;        // 1 per mapped 4 KiB page of the alias region
@@ -92,8 +95,8 @@ static uint64_t prb_arms, prb_ends[2];  // frz_lock: regions armed; probes ended
 
 static int watched(uint64_t addr, uint64_t size) {
     const RtGuestLayout *g = &L;
-    return (addr >= g->aslr.base && size <= LOW_SIZE && addr - g->aslr.base <= LOW_SIZE - size) ||
-           (addr >= g->alias.base && size <= ALIAS_SIZE && addr - g->alias.base <= ALIAS_SIZE - size);
+    return (addr >= g->aslr.base && size <= low_size && addr - g->aslr.base <= low_size - size) ||
+           (addr >= g->alias.base && size <= alias_size && addr - g->alias.base <= alias_size - size);
 }
 
 // frz_lock held exclusively: the pages of a probed region get back what they had, read-only in a frozen region.
@@ -321,6 +324,34 @@ static void reexec_or_fail(const char *what) {
     plat_reexec();
 }
 
+// The compact layout, for a system that leaves no room below the module window: macOS on ARM64 keeps its shared library
+// region and a guard there, and reserves tens of GiB of its own between the module window and 2^39, at a place that
+// changes with every start. The stack and heap block and the alias region go side by side into the first free hole
+// below 2^39 that holds them, the alias region shrinking in 4 GiB steps down to ALIAS_MIN (one reservation holds both,
+// so a size that does not fit leaves nothing behind). When no hole holds both, the block takes the first hole that
+// holds it and the alias region one above it. The block keeps its size: the heap region has to hold the game's pool.
+// 1 when both are reserved; on 0 the caller starts the process again, for another arrangement of the system's own
+// reservations.
+static int compact_layout(uint64_t *low, uint64_t *alias) {
+    for (uint64_t asize = ALIAS_SIZE; asize >= ALIAS_MIN; asize -= ALIAS_ALIGN)
+        for (uint64_t at = align_up(LOW_SEARCH_FROM + LOW_SIZE, ALIAS_ALIGN) - LOW_SIZE;
+             at + LOW_SIZE + asize <= RT_ADDRESS_LIMIT; at += ALIAS_ALIGN)
+            if (reserve_at(at, LOW_SIZE + asize, 1)) {
+                *low = at, *alias = at + LOW_SIZE, alias_size = asize;
+                return 1;
+            }
+    for (uint64_t at = LOW_SEARCH_FROM; at + LOW_SIZE <= RT_ADDRESS_LIMIT && !*low; at += GiB)
+        if (reserve_at(at, LOW_SIZE, 1)) *low = at;
+    if (!*low) return 0;
+    for (uint64_t asize = ALIAS_SIZE; asize >= ALIAS_MIN; asize -= ALIAS_ALIGN)
+        for (uint64_t at = align_up(*low + LOW_SIZE, ALIAS_ALIGN); at + asize <= RT_ADDRESS_LIMIT; at += ALIAS_ALIGN)
+            if (reserve_at(at, asize, 1)) {
+                *alias = at, alias_size = asize;
+                return 1;
+            }
+    return 0;
+}
+
 void mem_init(void) {
     if (L.pool) return;
     // Fixed window: modules, kernel region, host-function addresses.
@@ -336,13 +367,19 @@ void mem_init(void) {
     uint64_t low = 0, alias = 0;
     for (uint64_t at = LOW_SEARCH_FROM; at + LOW_SIZE <= mods_lo && !low; at += GiB)
         if (reserve_at(at, LOW_SIZE, 1)) low = at;
-    if (!low) reexec_or_fail("a 14 GiB stack and heap block below 2^39");
+    int compact = !low;
+    if (compact && !compact_layout(&low, &alias))
+        reexec_or_fail("a 14 GiB stack and heap block and an alias region of 12 GiB or more below 2^39");
     for (uint64_t at = align_up(low + LOW_SIZE, ALIAS_ALIGN); at + ALIAS_SIZE <= mods_lo && !alias; at += ALIAS_ALIGN)
         if (reserve_at(at, ALIAS_SIZE, 1)) alias = at;
     if (!alias) reexec_or_fail("a 64 GiB alias region below 2^39");
+    if (compact)
+        rt_log("memory: compact layout: stack and heap block %#llx+%llu GiB, alias region %#llx+%llu GiB",
+               (unsigned long long)low, (unsigned long long)(LOW_SIZE / GiB), (unsigned long long)alias,
+               (unsigned long long)(alias_size / GiB));
 
     plat_mem_fault_hook(thaw_fault);   // before the crash handler
-    alias_pages = calloc(ALIAS_PAGES, 1);
+    alias_pages = calloc(alias_size / PAGE, 1);
     if (!alias_pages) rt_fatal("memory: cannot allocate the alias page map");
     // nx2navi.ini is read here, once the address space is claimed and before the first setting: the pool size below
     // depends on NX2NAVI_APP_POOL and on the resolution settings (resolution.c decides them once, on this first call).
@@ -355,8 +392,8 @@ void mem_init(void) {
     L = (RtGuestLayout){
         .aslr = {low, RT_ADDRESS_LIMIT - low},
         .stack = {low + STACK_OFF, STACK_SIZE},
-        .heap = {low + HEAP_OFF, HEAP_CAP},
-        .alias = {alias, ALIAS_SIZE},
+        .heap = {low + HEAP_OFF, heap_cap},
+        .alias = {alias, alias_size},
         .kernel = {RT_KERNEL_BASE, RT_KERNEL_SIZE},
         .hostfn = {RT_HOSTFN_BASE, RT_HOSTFN_SIZE},
         .pool = pool ? strtoull(pool, NULL, 0) : DEFAULT_POOL + res_heap_extra_bytes(),   // resolution.c
@@ -393,7 +430,7 @@ static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <
 // ---- 0x01 SetHeapSize
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     plat_mutex_lock(&lock);
-    if (size > HEAP_CAP || size % 0x200000 || size + image_bytes() > L.pool) {
+    if (size > heap_cap || size % 0x200000 || size + image_bytes() > L.pool) {
         plat_mutex_unlock(&lock);
         return R_INVALID_STATE;
     }
@@ -596,7 +633,7 @@ static void taken_gap(uint64_t a, uint64_t *base, uint64_t *size) {
     uint64_t lo = 0, hi = RT_ADDRESS_LIMIT;
     RtRange known[3 + MOD_COUNT + 2];
     int n = 0;
-    known[n++] = (RtRange){L.aslr.base, LOW_SIZE};
+    known[n++] = (RtRange){L.aslr.base, low_size};
     known[n++] = L.alias;
     known[n++] = L.kernel;
     known[n++] = L.hostfn;
@@ -677,23 +714,19 @@ static void query_locked(uint64_t a, RtMemoryInfo *out) {
         r.base = RT_ADDRESS_LIMIT;
         r.size = 0 - RT_ADDRESS_LIMIT;
         r.state = ST_INACCESSIBLE;
-    } else if (a < low) {
-        r.base = 0;
-        r.size = low;
-        r.state = ST_FREE;
-    } else if (a < low + LOW_SIZE) {
+    } else if (a >= low && a < low + low_size) {
         uint64_t heap = L.heap.base;
         if (a >= heap && a < heap + heap_size) {
             r = (RtMemoryInfo){.base = heap, .size = heap_size, .state = ST_NORMAL, .perm = PERM_RW};
         } else if (a < heap) {
             r = (RtMemoryInfo){.base = low, .size = heap - low, .state = ST_FREE};
         } else {
-            r = (RtMemoryInfo){.base = heap + heap_size, .size = low + LOW_SIZE - heap - heap_size, .state = ST_FREE};
+            r = (RtMemoryInfo){.base = heap + heap_size, .size = low + low_size - heap - heap_size, .state = ST_FREE};
         }
     } else if (a - L.alias.base < L.alias.size) {
         uint64_t p = (a - L.alias.base) / PAGE;
         uint8_t v = alias_pages[p];
-        uint64_t s = run_start(alias_pages, p, v), e = run_end(alias_pages, p, ALIAS_PAGES, v);
+        uint64_t s = run_start(alias_pages, p, v), e = run_end(alias_pages, p, alias_size / PAGE, v);
         r = (RtMemoryInfo){.base = L.alias.base + s * PAGE, .size = (e - s) * PAGE, .state = v ? ST_NORMAL : ST_FREE,
                            .perm = v ? PERM_RW : PERM_NONE};
     } else if ((mi = module_index(a)) >= 0) {
@@ -710,10 +743,14 @@ static void query_locked(uint64_t a, RtMemoryInfo *out) {
         r = (RtMemoryInfo){.base = L.kernel.base, .size = L.kernel.size, .state = ST_THREADLOCAL, .perm = PERM_RW};
     } else if (a - L.hostfn.base < L.hostfn.size) {
         r = (RtMemoryInfo){.base = L.hostfn.base, .size = L.hostfn.size, .state = ST_INACCESSIBLE};
-    } else {
+    } else {   // no region of ours: free below the stack and heap block, the host's above it
         taken_gap(a, &r.base, &r.size);
-        r.state = ST_CODE;
-        r.perm = PERM_RX;
+        if (a < low) {
+            r.state = ST_FREE;
+        } else {
+            r.state = ST_CODE;
+            r.perm = PERM_RX;
+        }
     }
     // Moved stacks: the destination is Stack, the source Normal without access; free and normal regions around them
     // are clipped.
@@ -759,7 +796,7 @@ int mem_info(uint32_t id, uint64_t *out) {
     case 14: v = L.stack.base; break;
     case 15: v = L.stack.size; break;
     case 16: v = SYSTEM_RESOURCE_BUDGET; break;
-    case 17: v = sizeof stack_maps + ALIAS_PAGES; break;   // system resource in use: our bookkeeping
+    case 17: v = sizeof stack_maps + alias_size / PAGE; break;   // system resource in use: our bookkeeping
     case 28: v = 0; break;   // AliasRegionExtraSize: no kernel-owned extension
     default: return 0;
     }

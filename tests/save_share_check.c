@@ -61,6 +61,7 @@ NEVER(mem_thaw) NEVER(romfs_close) NEVER(romfs_entry) NEVER(romfs_entry_type) NE
 NEVER(romfs_handle) NEVER(romfs_image_path) NEVER(romfs_list) NEVER(romfs_open) NEVER(romfs_overlay)
 NEVER(romfs_overlay_count) NEVER(romfs_read) NEVER(romfs_size) NEVER(rt_call)
 int romfs_owns(const char *path) { (void)path; return 0; }
+int mem_probing(void) { return 0; }   // the write-back probe is off
 void fs_trace(const char *what, const char *path) { (void)what, (void)path; }
 
 int main(int argc, char **argv) {

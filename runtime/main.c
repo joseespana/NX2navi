@@ -318,12 +318,15 @@ static void host_probe(Cpu *c) { host_probe_hits++; c->x[0] = 42; }
 #endif
 
 static void check_cpu(void) {
+#if !defined(__x86_64__)
+    printf("cpu: no instruction set level to check on this architecture\n");
+#elif RT_CPU_LEVEL >= 3
     __builtin_cpu_init();
-#if RT_CPU_LEVEL >= 3
     int ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2");
     printf("cpu: x86-64-v3 (AVX2, FMA, BMI2) %s\n", ok ? "present" : "MISSING");
     CHECK(ok, "the lifted code is built for x86-64-v3");
 #else
+    __builtin_cpu_init();
     int ok = __builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt");
     printf("cpu: x86-64-v2 (SSE4.2, POPCNT) %s\n", ok ? "present" : "MISSING");
     CHECK(ok, "the lifted code is built for x86-64-v2");
@@ -354,8 +357,10 @@ static void check_layout(void) {
            (unsigned long long)g->aslr.base, (unsigned long long)g->aslr.size, (unsigned long long)g->stack.base,
            (unsigned long long)g->heap.base, (unsigned long long)g->alias.base, (unsigned long long)g->alias.size,
            (unsigned long long)g->kernel.base, (unsigned long long)g->hostfn.base);
-    CHECK(g->alias.base + g->alias.size <= lay[0].base && g->heap.base + g->heap.size <= g->alias.base,
-          "guest regions overlap");
+    // The stack and heap block and the alias region lie below the module window, or above the host-function window in
+    // the compact layout (memory.c compact_layout).
+    CHECK((g->alias.base + g->alias.size <= lay[0].base || g->aslr.base >= g->hostfn.base + g->hostfn.size) &&
+          g->heap.base + g->heap.size <= g->alias.base, "guest regions overlap");
 }
 
 // Every function start dispatches to its own function. The word after a start (unless that is a start too), a
@@ -447,7 +452,10 @@ static void check_memory(void) {
     mem_query(RT_HOSTFN_BASE + 0x40, &q);
     CHECK(q.state == 0x10 && q.base == RT_HOSTFN_BASE, "QueryMemory on the host-function window");
     mem_query(g->alias.base + g->alias.size + 0x1000, &q);
-    CHECK(q.state == 3 && q.base == g->alias.base + g->alias.size, "QueryMemory on host memory");
+    // Above the alias region lies host memory, or the end of the address space when the region ends there (the compact
+    // layout can put it last).
+    CHECK(q.base == g->alias.base + g->alias.size && q.state == (q.base < RT_ADDRESS_LIMIT ? 3 : 0x10),
+          "QueryMemory above the alias region");
     CHECK(mem_set_heap_size(0, &heap) == 0, "SetHeapSize 0");
     printf("memory: heap, physical memory, stack move, QueryMemory, GetInfo: %s\n", failures > before ? "FAIL" : "ok");
 }
@@ -550,7 +558,33 @@ static void portable_paths(RtConfig *c) {
     c->profile = portable_path(exe, "NX2NAVI_PROFILE_DIR", "profile", NULL, pp_profile, sizeof pp_profile, c->profile);
 }
 
+#ifdef __APPLE__
+// macOS: the first thread is the only one that may own windows, so the program runs on a second thread and the first
+// waits to become the window thread (gfx_window_sdl.c gfx_window_main_thread). The guest address space is claimed
+// before that thread's stack is mapped.
+static int program_main(int argc, char **argv);
+void gfx_window_main_thread(void);   // gfx.h
+static struct { int argc; char **argv; } g_main_args;
+
+static void program_thread(void *arg) {
+    (void)arg;
+    int code = program_main(g_main_args.argc, g_main_args.argv);
+    rt_log_sync();
+    plat_exit(code);
+}
+
 int main(int argc, char **argv) {
+    mem_init();
+    g_main_args.argc = argc, g_main_args.argv = argv;
+    if (!plat_thread_spawn(program_thread, NULL, "main", 0)) return program_main(argc, argv);
+    gfx_window_main_thread();
+    return 0;
+}
+
+static int program_main(int argc, char **argv) {
+#else
+int main(int argc, char **argv) {
+#endif
     mem_init();   // first: claim the guest address space before anything else can land there; reads nx2navi.ini
     // The build that wrote the log, at its top: an attached log from another install or version shows at a glance.
     rt_log("version: NX2navi %s, game %d.%d.%d", rt_port_version, rt_game_version / 100, rt_game_version / 10 % 10,

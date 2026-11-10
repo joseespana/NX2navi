@@ -28,6 +28,12 @@ LAYOUT = '''// A stand-in for the generated layout.h (tests/sync_wake_check.py).
 '''
 
 
+def march():
+    """x86-64-v3 as the game is built; nothing on another architecture (clang -dumpmachine names the target)."""
+    target = subprocess.run([compiler(), '-dumpmachine'], capture_output=True, text=True).stdout
+    return ['-march=x86-64-v3'] if target.startswith(('x86_64', 'amd64')) else []
+
+
 def main():
     work = ROOT / 'build' / 'test' / 'sync_wake'
     work.mkdir(parents=True, exist_ok=True)
@@ -38,11 +44,12 @@ def main():
     if win and MSYS_BIN.exists():
         env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
     rt = ROOT / 'runtime'
-    plat = [rt / 'platform' / ('win32.c' if win else 'linux.c'), rt / 'platform' / 'common.c']
+    mac = sys.platform == 'darwin'
+    plat = [rt / 'platform' / ('win32.c' if win else 'darwin.c' if mac else 'linux.c'), rt / 'platform' / 'common.c']
     libs = ['-lbcrypt', '-lpsapi', '-lwinmm', '-ldbghelp', '-lshell32', '-lole32', '-luser32', '-ladvapi32'] if win \
-        else ['-lpthread']
+        else ['-framework', 'CoreFoundation'] if mac else ['-lpthread']
     subprocess.check_call([compiler(), '-O1', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing',
-                           '-march=x86-64-v3', '-I', str(rt), '-I', str(work),
+                           *march(), '-I', str(rt), '-I', str(work),
                            str(ROOT / 'tests' / 'sync_wake_check.c'), *map(str, plat), '-o', str(exe), '-lm', *libs],
                           env=env)
     rc = subprocess.run([str(exe)], env=env, timeout=300).returncode

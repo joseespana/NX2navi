@@ -90,12 +90,24 @@ __asm__(".text\n"
 #else
 // The System V version: rsi and rdi are volatile there too, and the interrupted code may keep data in the 128 bytes
 // below its stack pointer (the red zone), so the return slot and the saves go below that. Without a red zone in the
-// way the slot is at entry - 136; the exit restores rsp to the entry value and jumps through the slot.
+// way the slot is at entry - 136; the exit restores rsp to the entry value and jumps through the slot. Mach-O names
+// carry a leading underscore and have no .type or .size.
+#ifndef AP_C
+#ifdef __APPLE__
+#define AP_C(name) "_" name
+#define AP_TYPE(name) ""
+#define AP_SIZE(name) ""
+#else
+#define AP_C(name) name
+#define AP_TYPE(name) ".type " name ", @function\n"
+#define AP_SIZE(name) ".size " name ", .-" name "\n"
+#endif
+#endif
 __asm__(".text\n"
-        ".globl " AP_NAME "\n"
-        ".type " AP_NAME ", @function\n"
+        ".globl " AP_C(AP_NAME) "\n"
+        AP_TYPE(AP_NAME)
         ".p2align 4\n"
-        AP_NAME ":\n"
+        AP_C(AP_NAME) ":\n"
         "    .cfi_startproc\n"
         "    leaq -136(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
         "    pushfq\n"
@@ -133,9 +145,9 @@ __asm__(".text\n"
         "    ldmxcsr 36(%rsp)\n"
         "    cld\n"
         AP_VZEROUPPER
-        "    call kern_ap_rip\n"
+        "    call " AP_C("kern_ap_rip") "\n"
         "    movq %rax, 88(%rbp)\n"   // the return slot: rbp + 10 pushes + pushfq
-        "    call kern_ap_yield\n"
+        "    call " AP_C("kern_ap_yield") "\n"
         "    ldmxcsr 32(%rsp)\n"
         "    " AP_VMOV " 64(%rsp), " AP_V "0\n"
         "    " AP_VMOV " 96(%rsp), " AP_V "1\n"
@@ -168,5 +180,5 @@ __asm__(".text\n"
         "    leaq 136(%rsp), %rsp\n"
         "    jmpq *-136(%rsp)\n"
         "    .cfi_endproc\n"
-        ".size " AP_NAME ", .-" AP_NAME "\n");
+        AP_SIZE(AP_NAME));
 #endif

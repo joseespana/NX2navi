@@ -225,10 +225,27 @@ static void window_main(void *arg) {
     }
 }
 
+#ifdef __APPLE__
+// macOS hands windows and their events to the process's first thread only. That thread waits here from the start of the
+// program (main.c main, which runs the program itself on a second thread) and becomes the window thread when
+// video_start asks for one.
+static PlatEvent g_main_wanted;   // zero: an auto-reset event, not set
+
+void gfx_window_main_thread(void) {
+    plat_event_wait(&g_main_wanted);
+    window_main(NULL);
+    for (;;) plat_sleep_ms(1000);   // SDL video failed: the program goes on without a window and ends the process
+}
+#endif
+
 static void video_start(void *arg) {
     (void)arg;
     plat_event_init(&g_video_ready, 1, 0);
+#ifdef __APPLE__
+    plat_event_set(&g_main_wanted);
+#else
     if (!plat_thread_spawn(window_main, NULL, "window", 0)) rt_fatal("gfx: cannot start the window thread");
+#endif
     plat_event_wait(&g_video_ready);
 }
 

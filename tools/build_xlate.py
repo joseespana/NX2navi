@@ -202,6 +202,16 @@ def write_identity(exe: Path) -> None:
     print(f"translator identity {ident[:16]} -> {exe.with_suffix('.id')}")
 
 
+def runtime_id() -> str:
+    """The .NET runtime identifier of this host: win-x64, linux-x64, or on macOS osx-arm64 / osx-x64 by its processor."""
+    if WIN:
+        return "win-x64"
+    if sys.platform == "darwin":
+        import platform
+        return "osx-arm64" if platform.machine().lower() in ("arm64", "aarch64") else "osx-x64"
+    return "linux-x64"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--id-only", action="store_true", help="write nx2navi_xlate.id for the exe already built")
@@ -226,6 +236,14 @@ def main() -> None:
             sys.exit(f"missing: vswhere.exe (expected in {VSWHERE_DIR}); NativeAOT cannot link without it")
         env["PATH"] = str(VSWHERE_DIR) + os.pathsep + env["PATH"]
 
+    if sys.platform == "darwin":
+        # Homebrew's .NET links the published program against Homebrew's own libraries (OpenSSL, brotli), and
+        # Homebrew's directories are not among the linker's defaults; OpenSSL is not even in its common lib directory.
+        dirs = [lib for p in ("/opt/homebrew", "/usr/local")
+                for lib in (Path(p) / "opt" / "openssl@4" / "lib", Path(p) / "opt" / "openssl" / "lib", Path(p) / "lib")
+                if (Path(p) / "bin" / "brew").is_file() and lib.is_dir()]
+        env["LIBRARY_PATH"] = os.pathsep.join([str(d) for d in dirs] + [v for v in (env.get("LIBRARY_PATH"),) if v])
+
     verify_vendor()
     src = prepare_sources()
     work = BUILD / "xlate"
@@ -236,7 +254,7 @@ def main() -> None:
     out = BUILD / "publish"
     shutil.rmtree(out, ignore_errors=True)
     cmd = [
-        dotnet, "publish", str(work / "nx2navi_xlate.csproj"), "-c", "Release", "-r", "win-x64" if WIN else "linux-x64",
+        dotnet, "publish", str(work / "nx2navi_xlate.csproj"), "-c", "Release", "-r", runtime_id(),
         "-p:PublishAot=true", "-p:InvariantGlobalization=true", f"-p:RyuSrc={src}", "-o", str(out),
     ]
     if a.llvm:

@@ -1,5 +1,5 @@
 // Platform layer: threads, time, locks, atomics, files. Runtime code calls this instead of the OS; one implementation
-// per OS (win32.c, linux.c). The FP control register lives in the per-architecture fp_*.h headers, inline, because
+// per OS (win32.c, linux.c, darwin.c). The FP control register lives in the per-architecture fp_*.h headers, inline, because
 // lifted FP code touches it on every operation.
 #pragma once
 #include <stddef.h>
@@ -80,10 +80,15 @@ void plat_fiber_free(PlatFiber *f);       // a fiber nobody runs
 typedef struct { uint64_t gpr[10]; uint32_t mxcsr, fpcw; uint64_t pad; uint8_t xmm[160]; } PlatJmp;
 int plat_jmp_save(PlatJmp *j) __attribute__((returns_twice, nothrow));
 _Noreturn void plat_jmp_go(PlatJmp *j);
-#elif defined(__linux__) && defined(__x86_64__)
-// SysV: rbx, rbp, r12-r15, the caller's rsp and the return address, then MXCSR and the x87 control word (linux.c).
-// Not glibc's jmp_buf: it mangles rsp, rbp and rip, so plat_frame_capture could not fill one.
+#elif (defined(__linux__) || defined(__APPLE__)) && defined(__x86_64__)
+// SysV: rbx, rbp, r12-r15, the caller's rsp and the return address, then MXCSR and the x87 control word (linux.c,
+// darwin.c). Not the C library's jmp_buf: glibc mangles rsp, rbp and rip, so plat_frame_capture could not fill one.
 typedef struct { uint64_t gpr[8]; uint32_t mxcsr, fpcw; } PlatJmp;
+int plat_jmp_save(PlatJmp *j) __attribute__((returns_twice, nothrow));
+_Noreturn void plat_jmp_go(PlatJmp *j);
+#elif defined(__APPLE__) && defined(__aarch64__)
+// AAPCS64: x19-x28, x29, the caller's sp and the return address, then FPCR and d8-d15 (darwin.c).
+typedef struct { uint64_t gpr[13], fpcr, d[8]; } PlatJmp;
 int plat_jmp_save(PlatJmp *j) __attribute__((returns_twice, nothrow));
 _Noreturn void plat_jmp_go(PlatJmp *j);
 #else
@@ -110,6 +115,10 @@ void plat_yield(void);                    // gives the rest of the time slice to
 static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
+#elif defined(__aarch64__)
+    // "yield" does nothing on most ARM64 cores. Four barriers take about as long as one x86 pause (some 40 ns), so
+    // the spin counts tuned on x86 wait as long here.
+    __asm__ volatile("isb\n\tisb\n\tisb\n\tisb");
 #endif
 }
 
@@ -244,6 +253,9 @@ int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs);
 // The pages of a watched reservation written since the last reset, up to max page addresses into pages, in address
 // order; reset: those reported start over as unwritten. UINT64_MAX when writes to the range are not tracked.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);
+// The bytes a write is recorded for: 4096 where the system tracks 4 KiB pages, the host's page size where it is larger
+// (16 KiB on macOS for ARM64: one write there reports the four 4 KiB pages of its host page).
+uint64_t plat_mem_watch_grain(void);
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));

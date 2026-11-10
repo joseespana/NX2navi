@@ -9,7 +9,6 @@
 // head, tail and the producer's own words sit on cache lines of their own: the producer writes head and its counters
 // per packet while the recorder reads head in its spin, and the recorder writes tail.
 #define VK_REC_IMPL
-#include <immintrin.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -66,7 +65,7 @@ static void rec_main(void *arg) {
     for (;;) {
         uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
         if (t == h) {
-            for (int i = 0; !slept && i < 4096 && t == h; i++) _mm_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            for (int i = 0; !slept && i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
             if (t == h) {
                 __atomic_store_n(&sleeping, 1, __ATOMIC_SEQ_CST);
                 h = __atomic_load_n(&head, __ATOMIC_SEQ_CST);
@@ -114,7 +113,7 @@ static void wait_space(uint64_t need) {
     uint64_t t0 = now_ns();
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
-    while (put_h + need - (tail_seen = __atomic_load_n(&tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
+    while (put_h + need - (tail_seen = __atomic_load_n(&tail, __ATOMIC_ACQUIRE)) > RING_WORDS) plat_pause();
     full_ns_all += now_ns() - t0;
 }
 
@@ -149,7 +148,7 @@ void rec_drain(void) {
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
     for (int i = 0; __atomic_load_n(&tail, __ATOMIC_ACQUIRE) != put_h; i++)
-        if (i < 20000) _mm_pause();
+        if (i < 20000) plat_pause();
         else plat_yield();
     uint64_t d = now_ns() - t0;
     RS_.drains++, RS_.drain_ns += d, drain_ns_all += d;

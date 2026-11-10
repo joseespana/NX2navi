@@ -821,6 +821,8 @@ int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs) {
 
 // Contains code Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 // GetWriteWatch with the reset flag.
+uint64_t plat_mem_watch_grain(void) { return 4096; }
+
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
     if (!max || !n) return 0;
     ULONG_PTR got = (ULONG_PTR)max;

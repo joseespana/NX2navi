@@ -403,21 +403,33 @@ static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_f
 void kern_ap_stub_ymm(void), kern_ap_stub_xmm(void);
 static void (*ap_stub)(void) = kern_ap_stub_xmm;   // the stub for this processor (ap_init)
 
+// The stub is written for x86-64 only: on another architecture owners are not interrupted (g_ap_int stays 0), and
+// priority inheritance and the preemption disable work as they do with NX2NAVI_ASYNC_PREEMPT=2.
+#if defined(__x86_64__)
+#define AP_HAVE_STUB 1
+#else
+#define AP_HAVE_STUB 0
+#endif
+
 // The processor has AVX and the system saves YMM state across thread switches (OSXSAVE, XCR0 bits 1 and 2).
 static int cpu_keeps_ymm(void) {
+#if !AP_HAVE_STUB
+    return 0;
+#else
     unsigned a = 1, b, c = 0, d;
     __asm__("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
     if ((c & 0x18000000u) != 0x18000000u) return 0;
     unsigned lo, hi;
     __asm__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
     return (lo & 6) == 6;
+#endif
 }
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
     const char *e = cfg_value("NX2NAVI_ASYNC_PREEMPT");
     g_ap = strcmp(e, "0") != 0;
-    g_ap_int = g_ap && strcmp(e, "2") != 0;
+    g_ap_int = g_ap && strcmp(e, "2") != 0 && AP_HAVE_STUB;
     if (g_ap) {
         RtModule m[16];
         int n = rt_linked_modules(m, 16);
@@ -479,6 +491,10 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 // keeps data in the upper halves, which every function the stub calls is free to clear, whatever the runtime itself was
 // compiled for. kern_ap_stub_xmm saves XMM0-15 with SSE moves: code on a processor without AVX has nothing in the upper
 // halves, and a VEX move there is an illegal instruction.
+#if !AP_HAVE_STUB
+void kern_ap_stub_ymm(void) {}
+void kern_ap_stub_xmm(void) {}
+#else
 #define AP_NAME "kern_ap_stub_ymm"
 #define AP_VMOV "vmovdqa"
 #define AP_V "%ymm"
@@ -493,6 +509,7 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 #define AP_V "%xmm"
 #define AP_VZEROUPPER ""
 #include "kernel_ap_stub.h"
+#endif
 
 enum { AP_NONE, AP_RETRY, AP_SENT };
 

@@ -249,6 +249,49 @@ well: the shadow copies are chosen for the measured cost above, not for a missin
 The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the compute decoder (`runtime/vk_astc.c`,
 `NX2NAVI_ASTC`) as on desktop AMD GPUs without it; frame times measured there include it.
 
+## macOS (in progress)
+
+The runtime builds for macOS 14.4 or later on ARM64 and x86-64, with the SDL3 window, input and menu of the Linux build
+and `runtime/platform/darwin.c` behind `platform.h`. Status: with stand-in modules in place of the lifted game the ARM64
+executable links and starts on an M1 Max under macOS 27, and `--probe-vkdevice`, `--probe-vkmem`, `--probe-gfx-abi`,
+`--probe-astc`, `--probe-nvn-tex` and `--probe-cfg` pass there; the x86-64 runtime library compiles and its tests run
+under Rosetta, but no x86-64 executable has been linked. The game itself has not run on macOS yet.
+
+Requirements, from Homebrew (`/opt/homebrew` on ARM64, `/usr/local` on x86-64):
+
+```sh
+brew install ninja molten-vk vulkan-headers vulkan-loader vulkan-tools vulkan-validationlayers shaderc spirv-tools \
+    sdl3 opus libvpx dav1d zstd dotnet uv pkgconf
+```
+
+Vulkan is the loader with MoltenVK, a driver that implements Vulkan on Metal; the instance asks for such drivers
+(`VK_KHR_portability_enumeration`, `runtime/vk_device.c`). MoltenVK 1.4.2 has the four required extensions and lacks
+geometry shaders, `VK_EXT_mesh_shader` (task and mesh draws are skipped), the graphics pipeline library, transform
+feedback and custom border colours. Vulkan Memory Allocator has no Homebrew package: `build_game.py` fetches the pinned
+header. The steps are the Linux ones; `build_game.py --arch arm64|x86_64` names the architecture (default: the host's),
+and `build_xlate.py` publishes the translator for `osx-arm64` or `osx-x64`.
+
+What differs from the other systems:
+
+- Windows belong to the process's first thread: the program runs on a second one and the first becomes the window
+  thread when a window is wanted (`runtime/main.c` `main`, `runtime/gfx_window_sdl.c` `gfx_window_main_thread`).
+- Address space. On ARM64 the system's shared library region fills `0x180000000` to `0xfc0000000`, a guard follows
+  up to `0x7000000000`, and about 25 GiB between there and 2^39 are reserved at a place that changes with every start.
+  The stack and heap block and the alias region then go side by side into one free hole, or into two when none holds
+  both, the alias region shrinking from 64 GiB to 12 GiB as needed; when they do not fit, the process starts again for
+  another arrangement, up to 20 times (`runtime/memory.c` `compact_layout`; the log line `memory: compact layout` says
+  what was taken).
+- Pages are 16 KiB on ARM64 and the guest's are 4 KiB: a host page gets the most permissive protection of the guest
+  pages in it (`darwin.c`, "virtual memory").
+- Write watch. The system keeps no record of written pages, so watched pages without a write on record are mapped
+  read-only and the first write to each faults (`darwin.c` `watch_fault`): 5.4 us a page on an M1 Max, 40 us under
+  Rosetta. Writes are recorded per host page (`plat_mem_watch_grain`). `NX2NAVI_WRITE_WATCH=0` turns the tracking off;
+  the back end then uploads every pool in full.
+- ARM64 has no CPU level (`--cpu` is for x86-64) and no asynchronous preemption stub yet: owners of a virtual core are
+  not interrupted there (`runtime/kernel.c` `AP_HAVE_STUB`).
+- The differential tests run on an ARM64 host with the same portable FP/SIMD lowering as on x86-64 (`runtime/simd.h`;
+  the host's FPCR mirrors the guest's as MXCSR does, `runtime/cpu.h` `rt_fpcr_sync`).
+
 ## Checks
 
 Before a commit:
