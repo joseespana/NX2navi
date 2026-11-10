@@ -76,6 +76,21 @@ static void mesa_cache_beside_exe(void) {
     plat_setenv("MESA_SHADER_CACHE_DIR", dir);
 }
 
+#ifdef __APPLE__
+// macOS: a MoltenVK of the game's own, with what the system's lacks (VK_EXT_mesh_shader), sits in moltenvk/ beside the
+// executable with its ICD manifest, MoltenVK_icd.json, naming libMoltenVK.dylib by a relative path. The Vulkan loader
+// takes it in place of the system's drivers through VK_DRIVER_FILES, unless the environment names drivers itself.
+static void moltenvk_beside_exe(void) {
+    char path[PLAT_PATH_MAX * 2];
+    if (plat_getenv("VK_DRIVER_FILES", path, sizeof path) || plat_getenv("VK_ICD_FILENAMES", path, sizeof path)) return;
+    int len = plat_exe_path(path, sizeof path - 40);
+    char *cut = len ? plat_last_sep(path) : NULL;
+    if (!cut) return;
+    strcpy(cut + 1, "moltenvk/MoltenVK_icd.json");
+    if (plat_file_exists(path)) plat_setenv("VK_DRIVER_FILES", path);
+}
+#endif
+
 #ifdef __linux__
 // NVIDIA's Linux driver keeps the pipelines it compiles in a disk cache of its own, by default in ~/.cache/nvidia,
 // shared with every program. One process adds at most __GL_SHADER_DISK_CACHE_SIZE to it (1 GiB unless set), and a start
@@ -127,6 +142,9 @@ void vk_driver_cache_env(void) {
     mesa_cache_beside_exe();
 #ifdef __linux__
     nvidia_cache_beside_exe();
+#endif
+#ifdef __APPLE__
+    moltenvk_beside_exe();
 #endif
 }
 
@@ -459,8 +477,15 @@ static int create_device(void) {
         int want = (gp && *gp && strcmp(gp, "0")) || (dmp && *dmp);
         g_vk.has_mesh_queries = want && c->mesh.meshShaderQueries && h->pipelineStatisticsQuery && c->f12.hostQueryReset;
         c->mesh.meshShaderQueries = g_vk.has_mesh_queries ? VK_TRUE : VK_FALSE;
-        if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
-        rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)");
+        g_vk.has_task_shader = c->mesh.taskShader;
+        // A portability driver may offer mesh shaders without the task stage (MoltenVK on Apple7 and Apple8 GPUs: Metal
+        // has no indirect mesh dispatch there): programs without a task stage are drawn, the others skipped. Elsewhere
+        // both stages stay required, as before.
+        if (!c->mesh.meshShader || (!c->mesh.taskShader && !g_vk.image_bytes_apart)) g_vk.has_mesh_shader = 0;
+        if (!g_vk.has_mesh_shader) g_vk.has_task_shader = 0;
+        rt_log("vk: mesh shaders: %s", !g_vk.has_mesh_shader ? "not supported (task/mesh draws are skipped)"
+                                       : g_vk.has_task_shader ? "VK_EXT_mesh_shader"
+                                                              : "VK_EXT_mesh_shader without task shaders (task programs are skipped)");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
