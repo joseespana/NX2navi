@@ -396,7 +396,8 @@ to `build\<ver>\shaders\` and runs it through the translator and `spirv-val`; fa
 every supported integer storage-image format, formatted float loads, typed texture fetch/sample/gather and masks,
 depth comparison, dimension queries, and signed/unsigned SM86 integer conversion. It checks that extended
 storage-image formats declare `StorageImageExtendedFormats`, while core formats do not acquire that requirement;
-unformatted reads declare their separate capability. All modules pass through `spirv-val` against Vulkan 1.3
+unformatted reads declare their separate capability. It also runs the depth comparison rewrite that fragment shaders
+get on macOS (`--frag-z-snap`, `tools/xlate/FragDepthSnap.cs`) on two hand-built modules. All modules pass through `spirv-val` against Vulkan 1.3
 with relaxed block, standard uniform-buffer and scalar layouts plus `LocalSizeId` enabled. Rebuild the translator
 before running it, or select an existing executable with `--translator PATH`; a translator patch changes its identity
 and automatically selects fresh runtime shader cache entries.

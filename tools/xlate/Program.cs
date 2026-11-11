@@ -231,6 +231,11 @@ static class SwshXlate
                     if (job["compute_out"] is JsonNode co) File.WriteAllBytes((string)co, spirv);
                     spirv = MeshSpirv.Convert(spirv, mesh);
                 }
+                // macOS: Apple GPUs before the M6 can store a depth one float step below the z a fragment shader reads
+                // for the same surface, so a shader that tests gl_FragCoord.z against its own surface's stored depth
+                // rejects it at scattered pixels (FragDepthSnap.cs). Other systems get the module as translated.
+                if (mesh == null && p.Info.UsesFragCoord && OperatingSystem.IsMacOS())
+                    spirv = FragDepthSnap.Apply(spirv, out _);
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), spirv);
                 var res = new JsonObject
                 {
@@ -316,6 +321,14 @@ static class SwshXlate
     static int Main(string[] args)
     {
         if (args.Length == 2 && args[0] == "--lower") return LowerFile(args[1]);
+        // --frag-z-snap <in.spv> <out.spv>: the macOS depth comparison rewrite (FragDepthSnap.cs) on one module, on any
+        // system, for tools/xlate_smoke.py. Prints the number of comparisons rewritten.
+        if (args.Length == 3 && args[0] == "--frag-z-snap")
+        {
+            File.WriteAllBytes(args[2], FragDepthSnap.Apply(File.ReadAllBytes(args[1]), out int snapped));
+            Console.WriteLine(snapped);
+            return 0;
+        }
         if (args.Length == 1 && args[0] == "--serve")
         {
             // One request per line: {"job": {...}, "out": "<dir>"}; one reply line "ok <key>" / "fail <key> <message>".

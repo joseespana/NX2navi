@@ -6,7 +6,7 @@ tools and vswhere.exe (docs/building.md). Run with .venv. On Linux it builds bui
 NativeAOT links with the system's clang (no MSVC); NativeAOT builds for the OS it runs on only.
 
 Next to the exe it writes nx2navi_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
-Program.cs, the csproj, the patches, the vendor tree). runtime/gfx_shader.c puts it into every shader cache key, so a
+Program.cs and the other C# sources, the csproj, the patches, the vendor tree). runtime/gfx_shader.c puts it into every shader cache key, so a
 translator change re-keys the cache without a hand-made KEY_VERSION bump. --id-only writes it for the exe already built
 (the caller vouches that the exe matches the sources).
 
@@ -180,7 +180,7 @@ def identity() -> str:
     tree, the vendor tree and the patch files as they are."""
     h = hashlib.sha256()
     h.update(f"settings\0{BUILD_SETTINGS}\n".encode())
-    for name in ("Program.cs", "AmpereLowering.cs", "MeshSpirv.cs", "nx2navi_xlate.csproj"):
+    for name in ("Program.cs", "AmpereLowering.cs", "MeshSpirv.cs", "FragDepthSnap.cs", "nx2navi_xlate.csproj"):
         h.update(f"{name}\0{code_digest(XLATE / name)}\n".encode())
     tree = BUILD / "ryujinx"
     if (tree / "src").is_dir():
@@ -249,7 +249,7 @@ def main() -> None:
     work = BUILD / "xlate"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    for name in ("Program.cs", "AmpereLowering.cs", "MeshSpirv.cs", "nx2navi_xlate.csproj"):
+    for name in ("Program.cs", "AmpereLowering.cs", "MeshSpirv.cs", "FragDepthSnap.cs", "nx2navi_xlate.csproj"):
         shutil.copy2(XLATE / name, work / name)
     out = BUILD / "publish"
     shutil.rmtree(out, ignore_errors=True)

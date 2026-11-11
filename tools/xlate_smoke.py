@@ -7,7 +7,8 @@ lowered Maxwell words before optimization, and recovery after malformed JSON. It
 RED.E.ADD.F32.FTZ.RN to a global address twice, once without and once with the job flag "float_atomic_add": the first
 must come back as a compare-and-swap loop, the second as one OpAtomicFAddEXT with its capability; both are validated.
 Then typed image and texture cases (image formats, typed fetch/sample/gather and channel masks, dimension queries,
-signed integer conversion) are translated and their numeric contracts checked. No game files.
+signed integer conversion) are translated and their numeric contracts checked. Last, the depth comparison rewrite that
+fragment shaders get on macOS (--frag-z-snap) runs on two hand-built modules. No game files.
 
   python tools/xlate_smoke.py [--translator /path/to/nx2navi_xlate]
 """
@@ -399,6 +400,62 @@ def run_typed(translator: Path, tmp: Path) -> int:
     return 0
 
 
+def depth_test_module(against_texture: bool) -> bytes:
+    """A fragment module: discard where gl_FragCoord.z is above a texture's red channel (or above the constant 0)."""
+    (void, fn, flt, v4, v2, integer, boolean, p_in, p_in_f, p_out, image, sampled, p_tex, frag_coord, out, tex, two, zero,
+     uv, black, main, entry, z_ptr, z, handle, texel, d, above, kill, merge) = range(1, 31)
+    def string(text: str) -> list[int]:
+        raw = text.encode() + b"\0"
+        raw += b"\0" * (-len(raw) % 4)
+        return list(struct.unpack(f"<{len(raw) // 4}I", raw))
+    module = [
+        (17, [1]), (14, [0, 1]), (15, [4, main, *string("main"), frag_coord, out]), (16, [main, 7]),
+        (71, [frag_coord, 11, 15]), (71, [out, 30, 0]), (71, [tex, 34, 0]), (71, [tex, 33, 0]),
+        (19, [void]), (33, [fn, void]), (22, [flt, 32]), (23, [v4, flt, 4]), (23, [v2, flt, 2]), (21, [integer, 32, 1]),
+        (20, [boolean]), (32, [p_in, 1, v4]), (32, [p_in_f, 1, flt]), (32, [p_out, 3, v4]),
+        (25, [image, flt, 1, 0, 0, 0, 1, 0]), (27, [sampled, image]), (32, [p_tex, 0, sampled]),
+        (59, [p_in, frag_coord, 1]), (59, [p_out, out, 3]), (59, [p_tex, tex, 0]),
+        (43, [integer, two, 2]), (43, [flt, zero, 0]), (44, [v2, uv, zero, zero]), (44, [v4, black, zero, zero, zero, zero]),
+        (54, [void, main, 0, fn]), (248, [entry]),
+        (65, [p_in_f, z_ptr, frag_coord, two]), (61, [flt, z, z_ptr]), (61, [sampled, handle, tex]),
+        (88, [v4, texel, handle, uv, 2, zero]), (81, [flt, d, texel, 0]),
+        (186, [boolean, above, z, d if against_texture else zero]),   # OpFOrdGreaterThan
+        (247, [merge, 0]), (250, [above, kill, merge]), (248, [kill]), (252, []), (248, [merge]),
+        (62, [out, black]), (253, []), (56, []),
+    ]
+    words = [0x07230203, 0x00010300, 0, 31, 0]
+    for opcode, operands in module:
+        words += [(len(operands) + 1) << 16 | opcode, *operands]
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+def check_depth_snap(translator: Path, tmp: Path) -> int:
+    """--frag-z-snap (tools/xlate/FragDepthSnap.cs, applied to fragment shaders on macOS): a comparison of gl_FragCoord.z
+    with a texture value takes a snapped z (one OpFwidth, the comparison's z operand an OpSelect) and still validates;
+    a comparison with a constant leaves the module byte-identical."""
+    for name, against_texture in (("depth_snap", True), ("depth_snap_const", False)):
+        source, result = tmp / (name + ".spv"), tmp / (name + "_out.spv")
+        source.write_bytes(depth_test_module(against_texture))
+        r = subprocess.run([str(translator), "--frag-z-snap", str(source), str(result)], capture_output=True, text=True, timeout=60)
+        v = subprocess.run([str(SPIRV_VAL), "--target-env", "vulkan1.3", str(result)], capture_output=True, text=True)
+        print(f"{name}: rewritten {r.stdout.strip()}, spirv-val exit {v.returncode} {v.stdout}{v.stderr}")
+        if r.returncode or v.returncode:
+            return 1
+        module = spirv_instructions(result.read_bytes())
+        if not against_texture:
+            if r.stdout.strip() != "0" or result.read_bytes() != source.read_bytes():
+                print(f"{name}: a comparison with a constant was changed", file=sys.stderr)
+                return 1
+            continue
+        selects = {args[1] for opcode, args in module if opcode == 169}
+        compare = [args for opcode, args in module if opcode == 186]
+        if (r.stdout.strip() != "1" or sum(opcode == 209 for opcode, _ in module) != 1 or len(compare) != 1
+                or compare[0][2] not in selects):
+            print(f"{name}: the depth comparison was not rewritten as expected", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--translator", type=Path, default=EXE, help="translator executable; default: build/xlate")
@@ -463,7 +520,7 @@ def main() -> int:
                 if not any(words[i:i + len(expected_words)] == expected_words for i in range(len(words))):
                     print(f"{job['key']}: lowered operand contract failed: {[hex(word) for word in words]}", file=sys.stderr)
                     return 1
-        return check_float_atomic(tmp) or run_typed(translator, tmp)
+        return check_float_atomic(tmp) or run_typed(translator, tmp) or check_depth_snap(translator, tmp)
 
 
 if __name__ == "__main__":
