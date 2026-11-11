@@ -47,8 +47,8 @@ SHADERS = 'MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource
 PIPELINE = 'MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm'
 DRAW = 'MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm'
 MESH_BLOCKS = 8   # indirect draws: up to 8192 workgroups
-MSL_VERSION = 3   # one more with each change to SPIRV_CROSS_PATCHES: 1 mesh positions flipped, 2 outputs per thread,
-                  # 3 unwritten fragment inputs
+MSL_VERSION = 4   # one more with each change to SPIRV_CROSS_PATCHES: 1 mesh positions flipped, 2 outputs per thread,
+                  # 3 unwritten fragment inputs, 4 mesh positions' depth range
 PATCHES = [
     (SHADERS,
      '[[object]] void objCmdDrawMeshTasks(const device MTLDispatchThreadgroupsIndirectArguments& args [[buffer(0)]],\n'
@@ -362,6 +362,23 @@ SPIRV_CROSS_PATCHES = [
      '\tSmallVector<uint32_t> unfed_frag_inputs;\n'
      '\n'
      '\tstd::unordered_set<SetBindingPair, InternalHasher> inline_uniform_blocks;\n'),
+    # Mesh shader positions in the game's depth range. The game's clip space has z from -w to w, which the back end asks
+    # for per pipeline (VK_EXT_depth_clip_control, negativeOneToOne); Metal's has z from 0 to w, so MoltenVK has
+    # SPIRV-Cross write z = (z + w) / 2 at the end of the last stage before the rasterizer. SPIRV-Cross did that for
+    # vertex, tessellation and geometry functions only: a mesh function's vertices kept the game's z, so Metal stored
+    # 1 - 2 near / w for them where every other draw stores 1 - near / w, the depth of a point half as far away, and
+    # clipped them within twice the near distance. Grass, foliage, particles and the ground mist (all mesh draws) then
+    # won the depth test against anything up to twice as far: a character standing in grass or mist was covered by what
+    # lies behind and around him, and passes that rebuild a position from the depth lit and fogged foliage as if it
+    # were at half its distance. The mesh stage now makes the same adjustment where it hands each vertex to the mesh.
+    ('spirv_msl.cpp',
+     '\t\t\tstatement("spvV.", to_member_name(type_vert, index), " = ", value, ";");\n',
+     '\t\t\tstatement("spvV.", to_member_name(type_vert, index), " = ", value, ";");\n'
+     '\t\t\tif (options.vertex.fixup_clipspace && builtin == BuiltInPosition)\n'
+     '\t\t\t{\n'
+     '\t\t\t\tstatement("spvV.", to_member_name(type_vert, index), ".z = (spvV.", to_member_name(type_vert, index),\n'
+     '\t\t\t\t          ".z + spvV.", to_member_name(type_vert, index), ".w) * 0.5;       // Adjust clip-space for Metal");\n'
+     '\t\t\t}\n'),
 ]
 
 def git(src, *args, capture=False):
