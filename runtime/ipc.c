@@ -204,9 +204,11 @@ static void csrng_fill(uint64_t addr, uint64_t size) {
     }
 }
 
-// csrng: the SDK's random source, which the game asks for entropy while it boots. GenerateRandomBytes (0) is its one
-// command; the host's generator fills the output buffer. The SDK sends it as a B buffer (seen at boot: one B buffer,
-// no others); a C buffer is filled too, with its reply entry, for a caller that lets the buffer type be chosen.
+// csrng: the SDK's cryptographic random source. GenerateRandomBytes (0) is its one command; the host's generator fills
+// the output buffer. The SDK sends it as a B buffer (a contributor's trace: one B buffer, no others); a C buffer is
+// filled too, with its reply entry, for a caller that lets the buffer type be chosen. No start or session logged on
+// our own PCs opens the service, but the game imports the call, and without the service a request for it ended the
+// game ("sm: service csrng is not implemented").
 static void csrng_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     if (rt_trace & RT_TRACE_IPC)
         rt_log("csrng: command %u (x%u a%u b%u w%u c%u)", rq->cmd, rq->nx, rq->na, rq->nb, rq->nw, rq->nc);
@@ -268,7 +270,7 @@ void ipc_handle_closed(int kind, void *obj) {
 }
 
 // ---- helpers for services
-static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
+static int readable(uint64_t a, uint64_t n) { return mem_host_readable(a, n); }
 
 void ipc_backtrace(void) {
     const Cpu *c = t_req;
@@ -875,6 +877,21 @@ static void probe_main(Cpu *c) {
     CHECK(pbs == POINTER_BUFFER_SIZE, "QueryPointerBufferSize %#x", pbs);
     CHECK(sv(c, 0x21, 0x0fff, 0, 0, 0) == IPC_R_BAD_HANDLE, "SendSyncRequest on a bad handle");
     if (audren) probe_renderer(c, audren);
+    // csrng: GenerateRandomBytes into a B buffer, as the SDK sends it; two requests give different bytes
+    uint32_t csrng = get_service(c, sm, "csrng", 0);
+    uint8_t *rnd = mem_kernel_alloc(64, 16);
+    memset(rnd, 0, 64);
+    for (int i = 0; csrng && i < 2; i++) {
+        Msg q = {.type = T_REQUEST, .cmd = 0, .nb = 1, .b[0] = {(uint64_t)(uintptr_t)(rnd + 32 * i), 32, 0}};
+        k = call(c, csrng, &q, &r);
+        CHECK(!k && !r.result, "csrng GenerateRandomBytes: kernel %#x result %#x", k, r.result);
+    }
+    static const uint8_t zero[32];
+    CHECK(memcmp(rnd, zero, 32) && memcmp(rnd + 32, zero, 32) && memcmp(rnd, rnd + 32, 32),
+          "csrng: the buffers were not filled with random bytes");
+    printf("csrng: GenerateRandomBytes filled two buffers of 32 bytes, each differently\n");
+    mem_kernel_free(rnd, 64);
+    CHECK(!csrng || !close_handle(c, csrng), "close csrng");
     CHECK(!close_handle(c, audren) && !close_handle(c, sm), "close audren:u and sm:");
     printf("sessions alive at the end: %ld, released %llu\n", ipc_sessions_live(),
            (unsigned long long)ipc_sessions_released());

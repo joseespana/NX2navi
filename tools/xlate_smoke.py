@@ -2,7 +2,8 @@
 
 Sends hand-assembled Maxwell and SM86 shaders through --serve and validates every result with spirv-val.
 Covers global memory ordering, multisampled array fetches, signed surface atomics, mesh output reads and global
-compare-and-swap operand order, and an image read without a format (StorageImageReadWithoutFormat). Checks the
+compare-and-swap operand order, an image read without a format (StorageImageReadWithoutFormat), and a size query that
+reads only the layer count of a texture the translator has no type answer for, which must be declared as an array. Checks the
 lowered Maxwell words before optimization, and recovery after malformed JSON. It also sends a compute shader that adds 1.0 with
 RED.E.ADD.F32.FTZ.RN to a global address twice, once without and once with the job flag "float_atomic_add": the first
 must come back as a compare-and-swap loop, the second as one OpAtomicFAddEXT with its capability; both are validated.
@@ -38,6 +39,8 @@ def mov32i(dest: int, value: float) -> int:
 
 EXIT = 0xE30000000000000F | PT
 SCHED = 0x001F8000FC0007E0  # scheduling control word; the decoder skips it
+RZ = 0xFF
+IMAGE0 = 0x120 // 4  # first NVN image handle in c[2] (tools/xlate/Program.cs ImgSlot): image slot 0
 
 
 def fragment_code(instructions: list[int], sm86: bool = False, output_mask: int = 15) -> bytes:
@@ -59,6 +62,7 @@ IMAGE0 = 0x120 // 4  # first NVN image handle in c[2] (tools/xlate/Program.cs Im
 
 
 SULD_P, SUST_P = 0x1D61, 0x1D65  # opcode bits 51-63 of SULD.P and SUST.P
+TXQ = 0x1BE9  # opcode bits 51-63 of TXQ (bound handle)
 
 
 def surface_p(opcode: int, data: int, coord: int, handle: int) -> int:
@@ -70,6 +74,14 @@ def surface_p(opcode: int, data: int, coord: int, handle: int) -> int:
 def image_read_code() -> bytes:
     """Compute code: R0-R3 = image 0 at x 0 (SULD.P), stored back there (SUST.P)."""
     words = [SCHED, surface_p(SULD_P, 0, RZ, IMAGE0), surface_p(SUST_P, 0, RZ, IMAGE0), EXIT]
+    return struct.pack(f"<{len(words)}Q", *words)
+
+
+def layer_count_code() -> bytes:
+    """Compute code: R0 = the layer count (component 2 of the dimension query) of texture handle 0x10, stored to image 0."""
+    txq = (TXQ << 51) | (0x10 << 36) | (0x4 << 31) | (1 << 22) | PT | (RZ << 8) | 0  # TexHeaderDimension, mask z, LOD RZ
+    sust = (SUST_P << 51) | (IMAGE0 << 36) | (0x1 << 20) | PT | (RZ << 8) | 0  # SUST.P 1D R of R0 at x 0
+    words = [SCHED, txq, sust, EXIT]
     return struct.pack(f"<{len(words)}Q", *words)
 
 
@@ -481,6 +493,12 @@ def main() -> int:
         image_code.write_bytes(image_read_code())
         jobs.append({"key": "image_read_cs", "stage": "cs", "code": str(image_code), "debug": False, "local": [1, 1, 1]})
         checks["image_read_cs"] = {}
+        # A compute shader that reads only the layer count of texture handle 0x10, for which the translator has no type
+        # answer: the texture must be declared as an array, or the count reads as 1.
+        layer_code = tmp / "layer_count_cs.bin"
+        layer_code.write_bytes(layer_count_code())
+        jobs.append({"key": "layer_count_cs", "stage": "cs", "code": str(layer_code), "debug": False, "local": [1, 1, 1]})
+        checks["layer_count_cs"] = {}
         lines = [json.dumps({"job": job, "out": str(out)}) for job in jobs]
         lines.extend(["this is not json", json.dumps({"job": dict(jobs[0], key="again"), "out": str(out)})])
         r = subprocess.run([str(translator), "--serve"], input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=60)
@@ -520,6 +538,10 @@ def main() -> int:
                 if not any(words[i:i + len(expected_words)] == expected_words for i in range(len(words))):
                     print(f"{job['key']}: lowered operand contract failed: {[hex(word) for word in words]}", file=sys.stderr)
                     return 1
+        layer_types = [t["type"] for t in json.loads((out / "layer_count_cs.res.json").read_text())["textures"]]
+        if layer_types != [0x103]:  # SamplerType Texture2D (3) | Array (0x100)
+            print(f"layer_count_cs: texture types {layer_types}, expected a 2D array [259]", file=sys.stderr)
+            return 1
         return check_float_atomic(tmp) or run_typed(translator, tmp) or check_depth_snap(translator, tmp)
 
 
