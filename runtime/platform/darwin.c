@@ -1160,6 +1160,60 @@ int plat_mem_prepare_write(uint64_t addr, uint64_t n) {
     return 1;
 }
 
+// A Metal buffer made over host memory gives the GPU a read-only view of pages that are read-only at that moment, and
+// drops what shaders write there without an error (measured on an M1 Max; protecting the pages after the buffer is
+// made is fine: the GPU's writes land and the CPU sees them). The watch keeps unwritten pages read-only, so the back
+// end brackets a host memory import with these two: open makes the range's unwritten pages writable without putting
+// them on record, close protects them again. A page written in between has no fault to record it, so open keeps a sum
+// of each such page and close puts those whose sum changed on record. vm_lock is held from open to close: nothing
+// else changes a protection or reports written pages meanwhile, and the import makes no call into this file.
+static uint64_t page_sum(uint64_t h) {
+    const uint64_t *w = (const uint64_t *)(uintptr_t)h;
+    uint64_t s = 0x9e3779b97f4a7c15ull;
+    for (uint64_t i = 0; i < hpg / 8; i++) s = (s ^ w[i]) * 0x100000001b3ull + (s >> 29);
+    return s | 1;   // never 0: 0 marks a page left alone
+}
+
+void plat_mem_import_open(uint64_t addr, uint64_t n, void **state) {
+    *state = NULL;
+    plat_mutex_lock(&vm_lock);
+    if (!n || !pstate || addr + n > PS_LIMIT || !watched(addr)) return;
+    uint64_t lo = addr & ~(hpg - 1), hi = (addr + n + hpg - 1) & ~(hpg - 1);
+    uint64_t *sum = calloc((size_t)((hi - lo) / hpg), sizeof *sum);
+    for (uint64_t h = lo; h < hi; h += hpg) {
+        watch_take();
+        if (host_state(h) == PS_RW && !dirty_all(h)) {
+            if (sum) sum[(h - lo) / hpg] = page_sum(h);
+            else dirty_put(h, hpg, 1);   // no memory for the sums: the page counts as written
+            mprotect((void *)(uintptr_t)h, hpg, PROT_READ | PROT_WRITE);
+        }
+        watch_give();
+    }
+    *state = sum;
+}
+
+void plat_mem_import_close(uint64_t addr, uint64_t n, void *state) {
+    uint64_t *sum = state;
+    if (sum) {
+        uint64_t lo = addr & ~(hpg - 1), hi = (addr + n + hpg - 1) & ~(hpg - 1);
+        for (uint64_t h = lo; h < hi; h += hpg) {
+            uint64_t was = sum[(h - lo) / hpg];
+            if (!was) continue;
+            watch_take();
+            if (host_state(h) == PS_RW && !dirty_all(h)) {
+                mprotect((void *)(uintptr_t)h, hpg, PROT_READ);   // a write from here on faults and is recorded
+                if (page_sum(h) != was) {
+                    dirty_put(h, hpg, 1);
+                    mprotect((void *)(uintptr_t)h, hpg, PROT_READ | PROT_WRITE);
+                }
+            }
+            watch_give();
+        }
+        free(sum);
+    }
+    plat_mutex_unlock(&vm_lock);
+}
+
 // The read-write guest pages of the range whose bit is set, in address order. With reset the bits reported are cleared
 // and their host pages mapped read-only again, both under the spin lock, so a write lands either before that (and is
 // in the memory the caller reads next) or after it (and faults, setting the bits again). When pages is full the scan

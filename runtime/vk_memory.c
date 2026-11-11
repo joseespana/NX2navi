@@ -192,8 +192,18 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                     .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = vk_gpa_wanted() ? (void *)&fi : (void *)&im,
                                .allocationSize = n, .memoryTypeIndex = (uint32_t)type};
-    if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
-        (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
+#ifdef __APPLE__
+    // Metal's view of pages that are read-only when the import is made drops the GPU's writes: the write watch's
+    // unwritten pages are writable while it is made (platform/darwin.c plat_mem_import_open).
+    void *watch_state;
+    plat_mem_import_open(r->import_lo, n, &watch_state);
+#endif
+    res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
+    if (res == VK_SUCCESS) res = vkBindBufferMemory(c->device, r->buf, r->mem, 0);
+#ifdef __APPLE__
+    plat_mem_import_close(r->import_lo, n, watch_state);
+#endif
+    if (res != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
         vkDestroyBuffer(c->device, r->buf, NULL);
@@ -1815,6 +1825,11 @@ static void mirror_mode(int discrete) {
     const char *sh = cfg_get("NX2NAVI_SHADOW");
 #ifdef _WIN32
     shadow_on = sh && *sh ? strcmp(sh, "0") != 0 : plat_is_wine();
+#elif defined(__APPLE__)
+    // macOS imports, as Windows does: its GPU shares the system's memory, and the import works since the pages are made
+    // writable before it (import_pool). In Kokiri Forest on an M1 Max that is 25.6 fps and 12 GB against 17 fps and
+    // 20 GB with shadow copies. NX2NAVI_SHADOW=1 turns the copies on.
+    shadow_on = sh && *sh && strcmp(sh, "0");
 #else
     shadow_on = !sh || !*sh || strcmp(sh, "0");
 #endif

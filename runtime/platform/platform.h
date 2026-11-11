@@ -270,6 +270,13 @@ uint64_t plat_mem_watch_grain(void);
 // pages in one call, where the watch works by protecting pages (Linux), so the stores do not fault page by page. The
 // pages count as written. Returns 0 when there is nothing to clear or it cannot be done; the write is valid either way.
 int plat_mem_prepare_write(uint64_t addr, uint64_t n);
+#ifdef __APPLE__
+// Around a host memory import of [addr, addr+n) (vk_memory.c import_pool): the range's pages the write watch holds
+// read-only are writable from open to close, so the GPU's view of them is writable, and a write made meanwhile is put
+// on record at close. Always called in pairs on one thread; a lock is held in between.
+void plat_mem_import_open(uint64_t addr, uint64_t n, void **state);
+void plat_mem_import_close(uint64_t addr, uint64_t n, void *state);
+#endif
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
