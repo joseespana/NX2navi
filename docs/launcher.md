@@ -38,10 +38,19 @@ Customize Launcher (on the home screen) makes the look the player's own:
 - Color Scheme: Forest (the colours above), Volcano, Lake, Desert, Temple and Shadow. A scheme is the first one with
   its woods, accents, backdrop and glow turned to other hues (`art.THEMES`, `art.recolor`), so each keeps the same
   light and dark steps and the same readable text. The window is drawn again in the new colours at once. The names
-  are plain words, not the game's.
+  are plain words, not the game's. Custom, the last one, takes three colours of the player's: Background Color for
+  the backdrop, Panel Color for the list panel, the description box and the title band, and Button Color for the
+  rows' cells and the orange choices in them. Each opens a picker in the description
+  box's place: a square of the hue's colours (saturation across, brightness up and down) and a hue bar under it, to
+  click or drag on, Hue, Saturation and Brightness rows for the arrows and the gamepad, and Hex Code, where a code
+  such as `#3A7BD5` is typed. The picked colour stands in for one colour of the first scheme (`art.CUSTOM_SLOTS`) and
+  the rest of its part of the window follows it, lighter and darker as in the first scheme (`art.follow`); text on
+  a light button or panel turns dark. The window takes the new colour as the mouse moves; Reset brings back the first scheme's colour.
 - Background: a picture of the player's own behind the panels instead of the scheme's backdrop (`launcher/ui/picture.py`:
-  PNG, JPEG, WebP, BMP, GIF or TIFF, read with Pillow). It is cut to the window's shape around its middle and kept as
-  `data/background.npy`, so the launcher needs the file no more; Background Dimming darkens it (0 to 80 %) for the
+  PNG, JPEG, WebP, BMP, GIF or TIFF, read with Pillow). It fills the window below the title band, so none of it is
+  hidden under the band: cut to that shape around its middle and scaled evenly, never stretched, and kept as
+  `data/background.npy`, so the launcher needs the file no more (a copy an older launcher kept for the whole window is
+  made again from the file while it is there); Background Dimming darkens it (0 to 80 %) for the
   text over it, the list panel and the description box turn a little see-through, and Remove Background brings the
   scheme's backdrop back.
 - Animations (on by default): the cursor glides from row to row, a new screen slides into place, sparks drift up
@@ -55,7 +64,20 @@ Customize Launcher (on the home screen) makes the look the player's own:
   it is silent until the player's game has been read. Moving the cursor makes no sound. They are played from memory
   (PlaySound on Windows; `pw-play`, `paplay` or `aplay` elsewhere).
 
-The choices are `theme`, `background`, `background_dim`, `animations` and `sounds` in `data/launcher.json`.
+- Add to Steam (Windows): the game in the player's Steam library as *The Legend of Zelda Ocarina of Time*, started
+  from there without the launcher's window (`launcher/steam.py`). Its pictures are made from the player's game when
+  the row is selected (`launcher/gameart.py`): Navi as the game's HUD draws her for the icon, the title screen's logo,
+  and a frame of the first title movie (the moonlit field) as the background, the cover and the wide tile, the movie
+  decoded with the toolchain's `dav1d.exe` and the logo with the runtime's own ASTC decoder built with its clang. They
+  go into each signed-in account's `config/grid`, the shortcut into its `shortcuts.vdf` (other shortcuts kept as they
+  are, ours updated when it is there; the file before the first change kept as `shortcuts.vdf.nx2navi-backup`).
+  Steam reads that file only when it starts and writes it back when it closes, so a running Steam is asked to close
+  first and started again after. The shortcut runs the launcher's `pythonw.exe` on `data/steam_play.pyw`, which
+  starts the launcher of `app/current.txt` with `--play`: the game starts as Play starts it, and the process waits
+  for it, so Steam counts the game as running while it is.
+
+The choices are `theme`, `custom_background`, `custom_panel`, `custom_buttons`, `background`, `background_dim`,
+`animations` and `sounds` in `data/launcher.json`.
 
 Navi (`art.NAVI`, 22 x 21 pixels, drawn in whole pixels at every size) is also the icon of `NX2navi.exe`,
 `NX2navi-Setup.exe`, the window and its taskbar button (`art.navi_ico`, written into the release by
@@ -65,8 +87,9 @@ identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi r
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
 last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
-Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, Background, with a picture set Background
-Dimming and Remove Background, Animations, Sounds, Back); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
+Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, with Custom Background Color, Panel Color and
+Button Color, Background, with a picture set Background Dimming and Remove Background, Animations, Sounds, Add to Steam on
+Windows, Back); the colour picker (Hue, Saturation, Brightness, Hex Code, Reset, Done); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
 Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
 A screen with more rows than the window holds draws them closer together (`fit_rows`).
@@ -93,7 +116,7 @@ toolchain/msys64/ucrt64  MSYS2's clang and libraries, downloaded from the MSYS2 
 toolchain/pkgs/          the downloaded package files
 data/launcher.json       settings; data/logs/launcher.log (and crash.log); data/cache/fonts and data/cache/sounds
                          (the game's font and interface sounds, decoded from the player's game);
-                         data/background.npy (the player's background picture, fitted to the window)
+                         data/background.npy (the player's background picture, fitted below the title band)
 game/                    the built game, unless another folder was chosen (its layout: README-BuildKit.md), with
                          saves/ for saves to import and the backups imports make (below)
 ```
@@ -334,6 +357,9 @@ game folder is the default `<launcher>\game`. The dump is never touched.
    ```
 
    `--ffx` puts AMD's signed `amd_fidelityfx_vk.dll` (FidelityFX SDK 1.1.4) in the release for FSR 3.1.
+   `--ffx4 <folder>` puts AMD's signed `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` (FSR SDK
+   2.4.0, the files of its `Kits/FidelityFX/signedbin/`) in the release for FSR 4; without it the menu offers no FSR 4.
+   `amd_fidelityfx_framegeneration_vk.dll` goes along when it is in that folder (`fsr4_fg`).
    NVIDIA's `nvngx_dlss.dll` goes in by itself: the script downloads the version `tools/dlss_pin.py` pins from
    NVIDIA's DLSS SDK repository (cached in `toolchain/launcher-dl/`), checks its size and sha256, and puts it in
    `bin/` with `nvngx_dlss-NOTICE.txt`; `make_game.py` copies both beside the game. `--dlss FILE` takes a copy on disk
@@ -378,7 +404,8 @@ pruning, unsafe archives, the background update (a release staged beside the run
 `staged.json` marker, a staged release installed after a restart, no install while the game runs, the install once
 it exited, nothing by itself with Install Updates Automatically off, a failed staging tried again after the next
 check), the font decoding on a system font wrapped like the game's, the look (every colour scheme complete, the
-background picture cut to the window's shape and kept, the sound effects as WAVs and low by default), `make_game.py`
+Custom scheme's picked colours, colour square and typed hex code, the background picture cut to the shape below the
+title band and kept, never stretched, the sound effects as WAVs and low by default), `make_game.py`
 on a synthetic
 `.nup` (events, skipped steps, `--rebuild` without the dump, step keys, the shaders key following the translator the
 build uses), the RomFS step beside the lift and compile

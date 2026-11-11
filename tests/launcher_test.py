@@ -18,7 +18,9 @@ Run: python tests/launcher_test.py   (Python 3.14 for the zstd tests; the window
   a source checkout's build/xlate/), the prompts step with a stand-in prompt tool, the object cache of the compile
   step with the system's C compiler, and its windres call under folders with spaces (a script in windres's place)
 - jobs: an install driven by a fake make_game.py, with and without the prompts row
-- the look: the colour schemes, the background picture's fitting and kept copy, the sound effects (low by default,
+- Add to Steam: the binary shortcuts file read and written back unchanged, a shortcut added and updated in place
+- the look: the colour schemes with the Custom one, its colour square and a typed hex code, the background picture's
+  fitting below the title band and kept copy, the sound effects (low by default,
   only the game's own select and back sounds, decoded from a made-up .bwav)
 - the window: --selftest draws every screen (skipped without a display)
 """
@@ -2708,6 +2710,92 @@ class LookTest(Tmp):
         with self.assertRaises(pic.PictureError):
             pic.load(self.tmp / 'gone.png')
 
+    def test_the_custom_scheme(self):
+        art = self.art
+        self.assertEqual(art.custom_palette({}), art.BASE)          # nothing picked yet: the first scheme's colours
+        slots = art.CUSTOM_SLOTS
+        self.assertEqual(list(slots), ['background', 'panel', 'buttons'])
+        parts = [k for _, keys, _ in slots.values() for k in keys]
+        self.assertEqual(len(parts), len(set(parts)), 'a colour in two parts')
+        self.assertEqual(set(parts), set(art.GROUPS['scene'] + art.GROUPS['wood'] + art.GROUPS['accent']))
+        pal = art.custom_palette({'background': '#3A7BD5', 'panel': '#203040', 'buttons': '#802020'})
+        self.assertEqual(pal['tint_mid'], '#3a7bd5')                 # the picked colours exactly where they stand in
+        self.assertEqual(pal['panel'], '#203040')
+        self.assertEqual(pal['label_mid'], '#802020')
+        only = art.custom_palette({'buttons': '#802020'})            # Button Color: the buttons and nothing else
+        self.assertLessEqual({k for k in art.BASE if only[k] != art.BASE[k]}, set(slots['buttons'][1]))
+        for k in ('label_top', 'label_bottom', 'value', 'orange', 'orange_light'):   # the orange choices too
+            self.assertNotEqual(only[k], art.BASE[k], k)
+        for k in ('panel', 'desc', 'wood_1', 'window', 'tint_mid'):   # not the panels, the title band, the backdrop
+            self.assertEqual(only[k], art.BASE[k], k)
+        self.assertEqual(round(art.hls(only['orange'])[0] * 360), 0)   # the choices in the picked hue, lighter
+        self.assertGreater(art.hls(only['orange'])[1], art.hls(only['label_mid'])[1])
+        panel = art.custom_palette({'panel': '#203040'})
+        self.assertLessEqual({k for k in art.BASE if panel[k] != art.BASE[k]}, set(slots['panel'][1]))
+        self.assertEqual(panel['label_mid'], art.BASE['label_mid'])
+        for slot, (ref, keys, _) in slots.items():
+            for k in keys:   # lighter than the picked colour where the first scheme's is lighter
+                if art.hls(art.BASE[k])[1] > art.hls(art.BASE[ref])[1] + 0.02:
+                    self.assertGreater(art.hls(pal[k])[1], art.hls(pal[ref])[1], k)
+        self.assertGreater(art.luminance(pal['text']), 0.6)          # light text on dark buttons
+        light = art.custom_palette({'buttons': '#f0e0a0'})
+        self.assertLess(art.luminance(light['text']), 0.3)           # and dark text on light ones
+        self.assertGreater(art.luminance(light['desc_text']), 0.6)   # the description box's text stays as it was
+        light = art.custom_palette({'panel': '#f0e0a0'})
+        self.assertLess(art.luminance(light['desc_text']), 0.3)      # dark on a light panel
+        self.assertGreater(art.luminance(light['text']), 0.6)
+        self.assertEqual(art.custom_palette({'buttons': 'red', 'background': None}), art.BASE)
+        held = art.PALETTE
+        try:
+            self.assertEqual(art.set_theme('custom', {'buttons': '#802020', 'other': '#000000'}), 'custom')
+            self.assertEqual(held['label_mid'], '#802020')
+            self.assertEqual(art.CUSTOM, {'background': art.BASE['tint_mid'], 'panel': art.BASE['panel'],
+                                          'buttons': '#802020'})
+            art.set_theme('custom', {})
+            self.assertEqual(dict(held), art.BASE)
+        finally:
+            art.set_theme('forest', {})
+
+    def test_the_colour_square(self):
+        import numpy as np
+        art = self.art
+        sq = art.color_square(40, 30, 0.0)                          # red
+        self.assertEqual(sq.shape, (30, 40, 4))
+        self.assertTrue(np.allclose(sq[0, -1, :3], [1, 0, 0], atol=0.05))   # top right: the full colour
+        self.assertLess(sq[-1, :, :3].max(), 0.05)                   # the bottom row: black
+        self.assertLess(np.ptp(sq[0, 0, :3]), 0.05)                  # left: grey
+        bar = art.hue_bar(60, 4)
+        self.assertTrue(np.allclose(bar[0, 20, :3], [0, 1, 0], atol=0.1))     # a third of the way: green
+        self.assertTrue(np.allclose(bar[0, 40, :3], [0, 0, 1], atol=0.1))     # two thirds: blue
+
+    def test_a_typed_hex_code(self):
+        try:
+            from launcher.ui.app import App
+        except ImportError:
+            self.skipTest('needs tkinter')
+        parse = App.parse_hex
+        self.assertEqual(parse('#3A7BD5'), (58, 123, 213))
+        self.assertEqual(parse(' 3a7bd5 '), (58, 123, 213))
+        self.assertEqual(parse('#37d'), (0x33, 0x77, 0xdd))
+        self.assertIsNone(parse('#3A7BD'))
+        self.assertIsNone(parse('blue'))
+
+    def test_the_picture_starts_below_the_band_and_is_never_stretched(self):
+        import numpy as np
+        art, pic = self.art, self.picture
+        store = self.tmp / 'background.npy'
+        old = np.zeros((1024, 1600, 3), dtype=np.uint8)              # a copy an older launcher kept for the window
+        old[:, :800, 0] = 255                                         # left half red: a circle stays a circle
+        np.save(store, old)
+        self.assertEqual(pic.kept_shape(store), (1024, 1600))
+        back = pic.kept(store, 1000, 580)                             # cut to the new shape, not squeezed
+        self.assertEqual(back.shape, (580, 1000, 3))
+        self.assertGreater(back[:, 490, 0].min(), 0.95)
+        self.assertLess(back[:, 510, 0].max(), 0.05)
+        img = art.backdrop(200, 128, 1.0, np.ones((116, 200, 3), dtype=np.float32), 0.0, top=12)
+        self.assertLess(img[6, 100, :3].max(), 0.2)                   # under the band: the scheme's colour
+        self.assertGreater(img[20, 100, :3].min(), 0.7)               # from the band's end on: the picture
+
     def test_ppm(self):
         import numpy as np
         px = bytes(range(18))
@@ -2839,6 +2927,60 @@ def have_display():
 
 
 @unittest.skipUnless(have_display(), 'needs tkinter, numpy and a display')
+class SteamTest(Tmp):
+    """launcher/steam.py on made-up Steam files: the binary shortcuts file read and written back unchanged, our
+    shortcut added beside another and updated in place, its id as Steam computes it, the accounts that signed in."""
+
+    def other(self):
+        from launcher import steam
+        exe = '"C:\\Games\\Other\\other.exe"'
+        entry = [[steam.T_INT, 'appid', struct.pack('<I', steam.appid(exe, 'Other'))], [steam.T_STR, 'AppName', 'Other'],
+                 [steam.T_STR, 'Exe', exe], [steam.T_STR, 'StartDir', '"C:\\Games\\Other\\"'],
+                 [steam.T_STR, 'icon', ''], [steam.T_INT, 'LastPlayTime', struct.pack('<I', 1234)],
+                 [steam.T_STR, 'sortas', ''], [steam.T_MAP, 'tags', [[steam.T_STR, '0', 'Favorite']]]]
+        return steam.vdf_dump([[steam.T_MAP, 'shortcuts', [[steam.T_MAP, '0', entry]]]])
+
+    def test_round_trip_add_and_update(self):
+        from launcher import steam
+        b = self.other()
+        self.assertEqual(b[-4:], b'\x08\x08\x08\x08')   # tags, the shortcut, shortcuts, the file
+        self.assertEqual(steam.vdf_dump(steam.vdf_load(b)), b)
+        self.assertFalse(steam.has_shortcut(b))
+        new, sid = steam.add_shortcut(b, '"C:\\NX2navi\\python\\pythonw.exe"', '"C:\\NX2navi"',
+                                      '"C:\\NX2navi\\data\\steam_play.pyw"', 'C:\\grid\\x_icon.png')
+        self.assertEqual(sid, steam.appid('"C:\\NX2navi\\python\\pythonw.exe"', steam.NAME))
+        self.assertTrue(sid & 0x80000000)
+        self.assertTrue(new.startswith(b[:-2]))   # the other shortcut stays byte for byte
+        self.assertTrue(steam.has_shortcut(new))
+        items = steam.vdf_load(new)[0][2]
+        self.assertEqual([k for _, k, _ in items], ['0', '1'])
+        ours = {k: v for _, k, v in items[1][2]}
+        self.assertEqual(ours['AppName'], 'The Legend of Zelda Ocarina of Time')
+        self.assertEqual(struct.unpack('<I', ours['appid'])[0], sid)
+        self.assertEqual(ours['LaunchOptions'], '"C:\\NX2navi\\data\\steam_play.pyw"')
+        self.assertEqual(ours['AllowOverlay'], struct.pack('<I', 1))
+        again, _ = steam.add_shortcut(new, '"D:\\NX2navi\\python\\pythonw.exe"', '"D:\\NX2navi"', '', 'x')
+        items = steam.vdf_load(again)[0][2]
+        self.assertEqual(len(items), 2)   # moved launcher: the same shortcut, updated
+        self.assertEqual({k: v for _, k, v in items[1][2]}['StartDir'], '"D:\\NX2navi"')
+        with self.assertRaises(steam.SteamError):
+            steam.vdf_load(b[:-5])
+
+    def test_new_file_and_accounts(self):
+        from launcher import steam
+        new, _ = steam.add_shortcut(b'', '"x.exe"', '"."', '', '')
+        self.assertTrue(steam.has_shortcut(new))
+        root = self.tmp / 'Steam'
+        for a in ('0', '1046310423', '22'):
+            (root / 'userdata' / a / 'config').mkdir(parents=True)
+        (root / 'config').mkdir()
+        (root / 'config' / 'loginusers.vdf').write_text('"users"\n{\n\t"76561199006576151"\n\t{\n\t}\n}\n')
+        self.assertEqual(steam.accounts(root), [root / 'userdata' / '1046310423' / 'config'])
+        (root / 'config' / 'loginusers.vdf').unlink()
+        self.assertEqual(steam.accounts(root), sorted([root / 'userdata' / '1046310423' / 'config',
+                                                       root / 'userdata' / '22' / 'config']))
+
+
 class WhilePlayingTest(Tmp):
     def test_the_games_restart_does_not_bring_the_launcher_back(self):
         try:

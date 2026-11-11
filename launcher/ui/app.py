@@ -9,7 +9,8 @@ flat cells and the orange choices are canvas items. Screens:
 
     first_run   the dump, the install folder, three choices and Begin Installation
     home        Play, Updates, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
-    customize   the colour scheme, the player's own background picture, animations and sounds
+    customize   the colour scheme, the player's own background picture, animations and sounds; Add to Steam
+    color       the Custom scheme's colour picker: a colour square, a hue bar and the hex code
     saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
                 and Copy Report
@@ -24,6 +25,7 @@ rows, a new screen slides in, sparks drift over the backdrop and Navi bobs in th
 plays the game's own decide and cancel sounds, read from the player's game, for a choice and for going back.
 """
 import argparse
+import colorsys
 import math
 import os
 import random
@@ -35,12 +37,13 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, steam, versions, winsys
 from ..context import Context
 from . import art, picture, sound
 
 W, H = 1000, 640
 BAND = (0, 1000, 56)            # x0, x1, height: the whole top of the window, which is also its title bar
+PIC_TOP = 60                    # the player's background picture starts under the band and its two lines
 TITLE_BUTTONS = (('min', 908, 954), ('close', 954, 1000))   # x ranges on the band
 PANEL = (112, 60, 580)          # x0, top, x1
 ROWS = (140, 552, 96)           # x0, x1, top
@@ -50,7 +53,16 @@ DESC = (614, 336)               # x, width
 P = art.PALETTE                 # the colour scheme in use: art.set_theme changes it in place
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
-DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2}
+DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
+         'color': 2}
+# the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
+# the hue bar (x0, y0, x1, y1)
+PICKER_BOX = (614, 100, 336, 452)
+SQUARE = (667, 160, 897, 390)
+BAR = (667, 408, 897, 430)
+CUSTOM_LABELS = {'background': 'Background Color', 'panel': 'Panel Color', 'buttons': 'Button Color'}
+CUSTOM_DESC = {'background': 'The color behind the menus.', 'panel': 'The color of the panels and the top bar.',
+               'buttons': 'The color of the buttons.'}
 DIMS = (0, 20, 40, 60, 80)      # Background Dimming, in percent
 SOUND_LEVELS = (('off', 'Off'), ('low', 'Low'), ('medium', 'Medium'), ('high', 'High'))
 
@@ -170,6 +182,12 @@ class App:
         self.look_message = ''   # why the last background picture was not taken, in Customize Launcher's descriptions
         self.save_message = ''   # the last import's result, shown in the import rows' descriptions
         self.export_message = ''   # the last Export Save result, shown in its description
+        self.steam_message = ''   # the last Add to Steam result, shown in its description
+        self.steam_busy = False   # Add to Steam is making the pictures or writing Steam's files
+        self.pick = None   # the colour picker: {'slot', 'h', 's', 'v'} (HSV in 0..1) of the colour being picked
+        self.pick_drag = None   # 'square' or 'bar' while the mouse drags on the picker
+        self.hex_entry = None   # the box the hex code is typed into
+        self.look_after = None   # the redraw a picked colour waits for (look_soon)
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
@@ -182,7 +200,7 @@ class App:
         self.ico = None
         # the look: the colour scheme, the player's background picture at the window's size (None: the scheme's own
         # backdrop), the sounds (none while the selftest draws the screens)
-        art.set_theme(self.settings.get('theme'))
+        art.set_theme(self.settings.get('theme'), self.custom_colors())
         self.bg_store = self.layout.data / 'background.npy'
         self.picture = None
         self.sounds = sound.Sounds(self.layout.cache, 'off' if args.selftest else self.settings.get('sounds'), ctx.log)
@@ -349,10 +367,19 @@ class App:
         return bool(self.settings.get('animations')) and not self.args.selftest
 
     def load_picture(self):
-        """The player's background at the window's size, when one is set and its kept copy is readable."""
+        """The player's background at the size of the window below the title band, when one is set and its kept copy
+        is readable. A copy an older launcher kept for the whole window is made again from the picture when the file
+        is still there, so no more of it is cut off than the new shape needs."""
         self.picture = None
-        if self.settings.get('background'):
-            self.picture = picture.kept(self.bg_store, self.X(W), self.X(H))
+        src = self.settings.get('background')
+        if src:
+            if picture.kept_shape(self.bg_store) not in (None, (picture.KEEP_H, picture.KEEP_W)) \
+                    and Path(src).is_file():
+                try:
+                    picture.keep(src, self.bg_store, self.root)
+                except (picture.PictureError, OSError, MemoryError, ValueError) as e:
+                    self.ctx.log(f'background: {src}: {e!r}; the copy kept before stays')
+            self.picture = picture.kept(self.bg_store, self.X(W), self.X(H) - self.X(PIC_TOP))
             if self.picture is None:
                 self.ctx.log(f'background: {self.bg_store} is missing or unreadable; the colour scheme\'s backdrop')
 
@@ -365,7 +392,8 @@ class App:
         c.delete('static')
         dim = max(0, min(100, self.settings.get('background_dim', 40))) / 100.0
         c.create_image(0, 0, anchor='nw', tags='static',
-                       image=self.sprite('backdrop', lambda: art.backdrop(self.X(W), self.X(H), s, self.picture, dim)))
+                       image=self.sprite('backdrop', lambda: art.backdrop(self.X(W), self.X(H), s, self.picture, dim,
+                                                                          self.X(PIC_TOP))))
         self.make_sparks()   # over the backdrop, under the panel and the band
         bx0, bx1, bh = BAND
         px0, ptop, px1 = PANEL
@@ -416,7 +444,7 @@ class App:
 
     def apply_look(self):
         """Draw everything again after the colour scheme, the background or Animations changed."""
-        art.set_theme(self.settings.get('theme'))
+        art.set_theme(self.settings.get('theme'), self.custom_colors())
         self.sprites.clear()
         self.root.configure(background=P['window'])
         self.canvas.configure(background=P['window'])
@@ -458,7 +486,7 @@ class App:
         self.canvas.bind('<Motion>', self.on_motion)
         self.canvas.bind('<Button-1>', self.on_click)
         self.canvas.bind('<B1-Motion>', self.on_drag)
-        self.canvas.bind('<ButtonRelease-1>', lambda e: setattr(self, 'drag', None))
+        self.canvas.bind('<ButtonRelease-1>', self.on_release)
         self.canvas.bind('<Leave>', lambda e: self.set_tb_hover(None))
         r.bind('<Alt-F4>', lambda e: self.on_close())
         r.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -529,9 +557,11 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color'):
             self.sounds.play('back')
-        if self.screen == 'settings':
+        if self.screen == 'color':
+            self.pick_done()
+        elif self.screen == 'settings':
             self.show('home', self.home_row('Settings'))
         elif self.screen == 'uninstall':
             self.show('settings')
@@ -558,6 +588,9 @@ class App:
             self.draw_title_buttons()
 
     def on_drag(self, e):
+        if self.pick_drag:
+            self.picker_at(e.x, e.y, self.pick_drag)
+            return
         if self.drag:   # moving the window without the system's help (Linux)
             dx, dy = self.drag
             self.root.geometry(f'+{e.x_root - dx}+{e.y_root - dy}')
@@ -595,6 +628,11 @@ class App:
             if not winsys.start_drag(self.root):
                 self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
             return
+        if self.screen == 'color':
+            part = self.picker_at(e.x, e.y)
+            if part:
+                self.pick_drag = part
+                return
         i = self.hit(e.x, e.y)
         if i is None:
             return
@@ -619,6 +657,12 @@ class App:
             r.actions[r.pick][1]()
         else:
             self.activate()
+
+    def on_release(self, e):
+        self.drag = None
+        if self.pick_drag:
+            self.pick_drag = None
+            self.pick_changed(final=True)
 
     def on_close(self):
         if self.job and self.job.result is None:
@@ -669,6 +713,7 @@ class App:
             # another screen slides into place: from the right when it lies deeper, from the left on the way back
             deeper = DEPTH.get(screen, 1) >= DEPTH.get(self.screen, 0)
             self.slide = float(self.X(44) if deeper else -self.X(44))
+        self.close_hex()
         self.screen = screen
         self.rows = getattr(self, 'rows_' + screen)()
         idx = self.focusables()
@@ -899,6 +944,10 @@ class App:
         def scheme(d):
             self.settings['theme'] = names[(names.index(art.theme) + d) % len(names)]
             self.settings.save()
+            # the rows again: Background Color and Button Color are there only while the scheme is Custom; the
+            # cursor stays on Color Scheme, the first row
+            art.set_theme(self.settings['theme'], self.custom_colors())
+            self.rows = self.rows_customize()
             self.apply_look()
 
         def dim(d):
@@ -930,7 +979,13 @@ class App:
         rows = [
             Row('enum', 'Color Scheme', get=lambda: art.THEMES[art.theme]['label'],
                 left=lambda: scheme(-1), right=lambda: scheme(1),
-                desc=('The launcher\'s colours.',)),
+                desc=('The launcher\'s colours. Custom lets you pick your own.',)),
+        ]
+        if art.theme == 'custom':
+            rows += [Row('value', CUSTOM_LABELS[slot], art.CUSTOM[slot], 'swatch',
+                         on=lambda sl=slot: self.open_picker(sl), desc=(CUSTOM_DESC[slot],))
+                     for slot in art.CUSTOM_SLOTS]
+        rows += [
             Row('value', 'Background', Path(self.settings['background']).name if custom else 'Choose a Picture',
                 'arrow', on=self.choose_background, desc=bg_desc),
         ]
@@ -951,10 +1006,270 @@ class App:
                 left=lambda: sounds(-1), right=lambda: sounds(1),
                 desc=('The game\'s select and back sounds. Low by default.',)),
             Row('divider'),
+        ]
+        if os.name == 'nt':
+            rows += [self.steam_row(), Row('divider')]
+        rows += [
             Row('action', 'Back', on=lambda: self.show('home', self.home_row('Customize Launcher')), height=40,
                 desc=('Back to the main menu.',)),
         ]
         return rows
+
+    # ---- the Custom scheme's colour picker
+
+    def custom_colors(self):
+        return {slot: self.settings.get('custom_' + slot, '') for slot in art.CUSTOM_SLOTS}
+
+    def open_picker(self, slot):
+        h = art.CUSTOM.get(slot) or art.CUSTOM_DEFAULT[slot]
+        hh, ss, vv = colorsys.rgb_to_hsv(*(int(h[i:i + 2], 16) / 255.0 for i in (1, 3, 5)))
+        self.pick = {'slot': slot, 'h': hh, 's': ss, 'v': vv}
+        self.show('color', 0)
+
+    def pick_hex(self):
+        p = self.pick
+        return art.hexcode(*colorsys.hsv_to_rgb(p['h'], p['s'], p['v']))
+
+    def pick_step(self, key, d):
+        """Hue by 5 degrees along the hue bar, saturation and brightness by 5 % (the arrows and the gamepad)."""
+        p = self.pick
+        if key == 'h':
+            p['h'] = (round(p['h'] * 72) + d) % 72 / 72.0
+        else:
+            p[key] = max(0.0, min(1.0, (round(p[key] * 20) + d) / 20.0))
+        self.pick_changed(final=True)
+
+    def pick_changed(self, final):
+        """The picked colour into the settings and onto the screen: the picker at once, the launcher's colours a
+        moment later (look_soon), so dragging over the square stays smooth. final: saved to launcher.json."""
+        if not self.pick:
+            return
+        self.settings['custom_' + self.pick['slot']] = self.pick_hex()
+        if final:
+            self.settings.save()
+        if self.screen == 'color':
+            self.rows = self.rows_color()
+            self.render()
+        self.look_soon(0 if final else 120)
+
+    def look_soon(self, ms):
+        if self.look_after:
+            self.root.after_cancel(self.look_after)
+        self.look_after = self.root.after(ms, self.look_now)
+
+    def look_now(self):
+        self.look_after = None
+        self.apply_look()
+
+    def pick_reset(self):
+        slot = self.pick['slot']
+        self.settings['custom_' + slot] = ''
+        self.settings.save()
+        art.CUSTOM[slot] = art.CUSTOM_DEFAULT[slot]
+        self.open_picker(slot)
+        self.focus = next(i for i, r in enumerate(self.rows) if r.label == 'Reset')
+        self.apply_look()
+
+    def pick_done(self):
+        slot = self.pick['slot'] if self.pick else 'background'
+        if self.look_after:
+            self.root.after_cancel(self.look_after)
+            self.look_after = None
+            self.apply_look()
+        rows = self.rows_customize()
+        self.show('customize', next((i for i, r in enumerate(rows) if r.label == CUSTOM_LABELS[slot]), 0))
+
+    def rows_color(self):
+        p = self.pick
+        return [
+            Row('enum', 'Hue', get=lambda: f'{round(p["h"] * 360) % 360}°',
+                left=lambda: self.pick_step('h', -1), right=lambda: self.pick_step('h', 1)),
+            Row('enum', 'Saturation', get=lambda: f'{round(p["s"] * 100)} %',
+                left=lambda: self.pick_step('s', -1), right=lambda: self.pick_step('s', 1)),
+            Row('enum', 'Brightness', get=lambda: f'{round(p["v"] * 100)} %',
+                left=lambda: self.pick_step('v', -1), right=lambda: self.pick_step('v', 1)),
+            Row('value', 'Hex Code', self.pick_hex().upper(), 'arrow', on=self.type_hex),
+            Row('divider'),
+            Row('value', 'Reset', '', 'arrow', on=self.pick_reset),
+            Row('divider'),
+            Row('action', 'Done', on=self.pick_done, height=40),
+        ]
+
+    def picker_at(self, x, y, part=None):
+        """The colour under the mouse at (x, y) on the square or the bar into the picker; which of the two it was
+        (part: the one being dragged, which takes the mouse also outside it), or None."""
+        X, p = self.X, self.pick
+
+        def inside(box, m=0):
+            x0, y0, x1, y1 = box
+            return X(x0) - X(m) <= x <= X(x1) + X(m) and X(y0) - X(m) <= y <= X(y1) + X(m)
+
+        def frac(v, a, b):
+            return max(0.0, min(1.0, (v - X(a)) / max(1, X(b) - X(a))))
+        sx0, sy0, sx1, sy1 = SQUARE
+        bx0, _, bx1, _ = BAR
+        if part == 'square' or (part is None and inside(SQUARE, 4)):
+            p['s'] = frac(x, sx0, sx1)
+            p['v'] = 1 - frac(y, sy0, sy1)
+            part = 'square'
+        elif part == 'bar' or (part is None and inside(BAR, 8)):
+            p['h'] = min(frac(x, bx0, bx1), 0.9999)
+            part = 'bar'
+        else:
+            return None
+        self.pick_changed(final=False)
+        return part
+
+    def type_hex(self):
+        """A box over the Hex Code row to type a colour into, like #3A7BD5; Enter takes it, Esc leaves it."""
+        r = self.focused()
+        if self.hex_entry or not r or not r.value_rect:
+            return
+        x0, y0, x1, y1 = r.value_rect
+        X = self.X
+        e = tk.Entry(self.canvas, font=self.f['label'], bg=P['value'], fg=P['value_text'],
+                     insertbackground=P['value_text'], selectbackground=P['orange'], selectforeground=P['on_text'],
+                     relief='flat', justify='center', highlightthickness=1, highlightcolor=P['orange'],
+                     highlightbackground=P['value_border'])
+        e.insert(0, self.pick_hex().upper())
+        e.select_range(0, 'end')
+        self.hex_entry = e
+        self.canvas.create_window(x0 + X(3), y0 + X(3), anchor='nw', window=e, width=x1 - x0 - X(6),
+                                  height=y1 - y0 - X(6), tags='hexentry')
+        e.focus_set()
+
+        def take(ev):
+            self.hex_typed(e.get())
+            return 'break'
+
+        def leave(ev):
+            self.close_hex()
+            return 'break'
+        for key in ('<Return>', '<KP_Enter>'):
+            e.bind(key, take)
+        e.bind('<Escape>', leave)
+        for key in ('<Up>', '<Down>', '<space>'):
+            e.bind(key, lambda ev: 'break')
+        e.bind('<FocusOut>', lambda ev: self.close_hex())
+
+    @staticmethod
+    def parse_hex(text):
+        """(r, g, b) in 0..255 of a typed hex code (#3A7BD5, 3A7BD5 or #37D), or None."""
+        t = text.strip().lstrip('#').lower()
+        if len(t) == 3:
+            t = ''.join(ch * 2 for ch in t)
+        return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4)) if art.HEX.match('#' + t) else None
+
+    def hex_typed(self, text):
+        got = self.parse_hex(text)
+        if got is None:
+            self.sounds.play('back')
+            self.hex_entry.select_range(0, 'end')
+            return
+        self.sounds.play('select')
+        hh, ss, vv = colorsys.rgb_to_hsv(*(v / 255.0 for v in got))
+        self.pick.update(h=hh, s=ss, v=vv)
+        self.close_hex()
+        self.pick_changed(final=True)
+
+    def close_hex(self):
+        if self.hex_entry:
+            e, self.hex_entry = self.hex_entry, None
+            self.canvas.delete('hexentry')
+            e.destroy()
+            try:
+                self.root.focus_force()
+            except tk.TclError:
+                pass
+
+    def draw_picker(self):
+        """The colour picker in the description box's place: the slot's name, the colour square of the picked hue
+        with a ring on the picked colour, the hue bar, and the colour itself with its hex code."""
+        c, X, s, p = self.canvas, self.X, self.s, self.pick
+        bx, by, bw, bh = PICKER_BOX
+        key = ('desc', X(bw), X(bh) // 4)
+        if key not in self.sprites:
+            img, pad = art.desc_box(X(bw), X(bh), s, self.see_through())
+            self.sprites[key] = (art.photo(self.root, img), pad)
+        pic, pad = self.sprites[key]
+        c.create_image(X(bx) - pad, X(by) - pad, anchor='nw', image=pic, tags='dyn')
+        self.text(X(bx + 26), X(by + 34), CUSTOM_LABELS[p['slot']], self.f['heading'], P['text_bright'])
+        sx0, sy0, sx1, sy1 = SQUARE
+        sw, sh = X(sx1) - X(sx0), X(sy1) - X(sy0)
+        hue = round(p['h'], 3)
+        square = self.sprite(('square', sw, sh, hue), lambda: art.color_square(sw, sh, hue))
+        c.create_rectangle(X(sx0) - 1, X(sy0) - 1, X(sx0) + sw, X(sy0) + sh, outline=P['value_border'], tags='dyn')
+        c.create_image(X(sx0), X(sy0), anchor='nw', image=square, tags='dyn')
+        size = X(18)
+        mark = self.sprite(('mark', size), lambda: art.picker_mark(size, s))
+        c.create_image(X(sx0) + round(p['s'] * sw), X(sy0) + round((1 - p['v']) * sh), image=mark, tags='dyn')
+        bx0, by0, bx1, by1 = BAR
+        bw_, bh_ = X(bx1) - X(bx0), X(by1) - X(by0)
+        bar = self.sprite(('hues', bw_, bh_), lambda: art.hue_bar(bw_, bh_))
+        c.create_rectangle(X(bx0) - 1, X(by0) - 1, X(bx0) + bw_, X(by0) + bh_, outline=P['value_border'], tags='dyn')
+        c.create_image(X(bx0), X(by0), anchor='nw', image=bar, tags='dyn')
+        c.create_image(X(bx0) + round(p['h'] * bw_), X(by0) + bh_ // 2, image=mark, tags='dyn')
+        hexc = self.pick_hex()
+        c.create_rectangle(X(bx0), X(452), X(bx0 + 64), X(500), fill=hexc, outline=P['value_border'], tags='dyn')
+        self.text(X(bx0 + 80), X(476), hexc.upper(), self.f['label'], P['text_bright'])
+        self.text(X(bx + 26), X(526), 'Click or drag the square and the bar.', self.f['small'], P['muted'])
+
+    def steam_row(self):
+        """Add to Steam: the game in the Steam library, started from there without the launcher (launcher/steam.py)."""
+        found = steam.find_steam()
+        desc = ('Adds the game to your Steam library with its own icon and artwork, so you can start it from Steam.',
+                'Steam restarts while it is added.')
+        if self.steam_message:
+            desc = (self.steam_message,) + desc
+        if self.steam_busy:
+            value, style = 'Adding…', 'dim'
+        elif not found:
+            value, style = 'Steam not found', 'dim'
+        else:
+            value, style = ('Added' if steam.added(found[0]) else ''), 'arrow'
+        return Row('value', 'Add to Steam', value, style, on=self.add_to_steam, desc=desc)
+
+    def add_to_steam(self):
+        import threading
+        if self.steam_busy:
+            return
+        gd = self.settings.get('game_dir')
+        if not steam.find_steam():
+            self.steam_message = 'Steam is not installed on this PC.'
+            self.sounds.play('back')
+            self.show('customize', self.focus)
+            return
+        if not gd or not (Path(gd) / 'ocarina.exe').is_file():
+            self.steam_message = 'The game is not built yet.'
+            self.sounds.play('back')
+            self.show('customize', self.focus)
+            return
+        self.steam_busy = True
+        self.steam_message = 'Adding to Steam…'
+        self.sounds.play('select')
+        self.show('customize', self.focus)
+        dump = self.settings.get('dump')
+
+        def work():
+            try:
+                text, ok = steam.add(self.layout, gd, dump, self.ctx.log), True
+            except steam.SteamError as e:
+                text, ok = str(e), False
+            except Exception as e:   # a Steam folder in a state nobody expected: say so instead of dying
+                import traceback
+                self.ctx.log('steam: ' + traceback.format_exc())
+                text, ok = f'Adding to Steam failed: {e}', False
+            self.ctx.log(f'steam: {text}')
+            self.root.after(0, lambda: self.steam_done(text, ok))
+        threading.Thread(target=work, daemon=True).start()
+
+    def steam_done(self, text, ok):
+        self.steam_busy = False
+        self.steam_message = text
+        if not ok:
+            self.sounds.play('back')
+        if self.screen == 'customize':
+            self.show('customize', self.focus)
 
     def choose_background(self):
         start = self.settings.get('background')
@@ -1662,7 +1977,10 @@ class App:
             y += h + self.row_gap
         self.draw_status()
         self.draw_cursor()
-        self.draw_desc()
+        if self.screen == 'color' and self.pick:
+            self.draw_picker()
+        else:
+            self.draw_desc()
         self.slide_applied = int(self.slide)
         if self.slide_applied:   # drawn in place, then put where the slide has got to (step_slide)
             c.move('dyn', self.slide_applied, 0)
@@ -1800,6 +2118,16 @@ class App:
             self.canvas.create_text(sx, cy, text=r.value, font=vfont, fill=P['on_text'], anchor='w', tags='dyn')
             img = self.sprite(('chev', cw, ch, False, 'on'), lambda: art.chevron(cw, ch, P['on_text']))
             c.create_image(sx + label_w + X(10), cy, anchor='w', image=img, tags='dyn')
+        elif r.style == 'swatch':   # a colour of the Custom scheme: a patch of it and its hex code
+            cw, ch = X(9), X(12)
+            img = self.sprite(('chev', cw, ch, False, 'dim'), lambda: art.chevron(cw, ch, P['chevron_dim']))
+            c.create_image(x1 - X(16), cy, anchor='e', image=img, tags='dyn')
+            tw = vfont.measure(r.value.upper())
+            sw = X(26)
+            sx = (vx0 + x1 - X(16) - cw - X(10)) // 2 - (sw + X(10) + tw) // 2
+            c.create_rectangle(sx, cy - X(9), sx + sw, cy + X(9), fill=r.value, outline=P['value_border'], tags='dyn')
+            c.create_text(sx + sw + X(10), cy, text=r.value.upper(), font=vfont, fill=P['value_text'], anchor='w',
+                          tags='dyn')
         elif r.style == 'arrow':
             cw, ch = X(9), X(12)
             img = self.sprite(('chev', cw, ch, False, 'dim'), lambda: art.chevron(cw, ch, P['chevron_dim']))
@@ -1982,6 +2310,8 @@ def parse_args(argv):
     ap.add_argument('--root', help='the launcher folder (tests)')
     ap.add_argument('--selftest', action='store_true', help='draw every screen and close')
     ap.add_argument('--shots', help='with --selftest: save a PNG of each screen into this folder')
+    ap.add_argument('--play', action='store_true',
+                    help='start the game without the window and wait for it (the Steam shortcut, launcher/steam.py)')
     a, _unknown = ap.parse_known_args(argv)
     return a
 
@@ -2011,12 +2341,40 @@ def single_instance(layout, wait):
             time.sleep(0.25)
 
 
+def play_only(ctx):
+    """--play, from the Steam shortcut (launcher/steam.py): the game starts from its folder with its console hidden, as
+    Play starts it, and this process waits until it and the copies its own Restart starts have ended, so Steam shows
+    the game as running all that time. None when there is no built game: the launcher's window opens instead."""
+    gd = ctx.settings.get('game_dir')
+    exe = Path(gd) / 'ocarina.exe' if gd else None
+    if not exe or not exe.is_file():
+        return None
+    if saves.game_running(gd):
+        ctx.log('play from Steam: the game is already running')
+        return 0
+    try:
+        proc = winsys.start_game(exe)
+    except OSError as e:
+        ctx.log(f'play from Steam: {exe}: {e}')
+        return None
+    ctx.log(f'play from Steam: {exe}')
+    time.sleep(2)
+    while proc.poll() is None or saves.game_running(gd):
+        time.sleep(1)
+    ctx.log(f'play from Steam: the game ended (code {proc.returncode})')
+    return 0
+
+
 def main(argv=None):
     a = parse_args(sys.argv[1:] if argv is None else argv)
     winsys.dpi_aware()
     winsys.app_id()
     from ..paths import Layout
     ctx = Context(Layout(root=a.root) if a.root else None)
+    if a.play and not a.selftest:
+        code = play_only(ctx)
+        if code is not None:
+            return code
     lock = None
     if not a.selftest:
         lock = single_instance(ctx.layout, 20 if (a.continue_update or a.rolled_back) else 2)
