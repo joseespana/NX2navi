@@ -45,7 +45,12 @@ typedef struct VkCtx {
         // A driver that implements Vulkan on another graphics API (VK_KHR_portability_subset; Metal behind it): an
         // image bound to a pool's memory has texels of its own there, not the bytes a buffer on that memory holds,
         // so a pool filled with zeros does not make its images start at zero (vk_texture.c, NX2NAVI_FIX_ZERO).
-        image_bytes_apart;
+        image_bytes_apart,
+        // The same drivers: a timeline value is reached from inside the command buffer that signals it, before the
+        // driver has finished with that command buffer, and an object destroyed then is taken from it while it runs
+        // (Metal fails the command buffer: "Invalid Resource"). What waits for the GPU before destroying goes by the
+        // submissions' fences instead (vk_sync.c fence_bound, vk_sync_free_done).
+        late_completion;
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. NX2NAVI_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -53,6 +58,9 @@ typedef struct VkCtx {
     // VK_FEEDBACK_RESTART (the pass ends and restarts behind the full barrier).
     int feedback;                           // VK_FEEDBACK_*
     uint32_t min_imported_host_alignment;   // VK_EXT_external_memory_host
+    // VK_EXT_mesh_shader's maxMeshSharedMemorySize and maxTaskSharedMemorySize where a portability driver reports them
+    // (vk_pipeline.c mesh_shared_fits); 0 elsewhere, no check.
+    uint32_t mesh_shared_max, task_shared_max;
     int device_index;                       // index in vkEnumeratePhysicalDevices
 } VkCtx;
 enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
@@ -429,6 +437,7 @@ void vk_defer_view(VkImageView view);
 void vk_defer_free(void *p);
 int vk_exec_image_gone(VkImage image);   // texture lock held: the replay's views of image go with it; returns how many
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+void vk_mem_graves_present(uint64_t frame);   // at each present: pool buffers waiting for an idle queue go (VkCtx.late_completion)
 // ---- ASTC (vk_astc.c). NX2NAVI_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
@@ -660,6 +669,7 @@ int vk_sync_wb_split(void);                 // NX2NAVI_WB_SPLIT: the write-backs
 VkCommandBuffer vk_sync_split_exec(void);   // vk_sync_split for the part before a submission's write-backs
 int vk_mem_mirror_wb_pending(void);         // vk_memory.c: vk_mem_mirror_end has write-backs to record
 uint64_t vk_sync_fence_done(void);         // highest done value
+uint64_t vk_sync_free_done(uint64_t reached); // reached, or less: the newest value whose objects may be destroyed
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // waits idle, stops the worker, drains retirements, frees command/query pools

@@ -3,10 +3,11 @@ request) and install it beside a game.
 
 The system's MoltenVK (Homebrew) has no VK_EXT_mesh_shader, and the game draws its foliage, particles and glows with
 mesh shaders: without them those draws are skipped. KhronosGroup/MoltenVK pull request 2842 adds the extension on Metal's
-own mesh pipelines (task shaders only from Apple9 GPUs on; Apple7 and Apple8 get mesh shaders without the task stage).
+own mesh pipelines (task shaders only from Apple9 GPUs on; PATCHES below give them to Apple7 and Apple8 too), and
+SPIRV_CROSS_PATCHES fix SPIRV-Cross's mesh stage.
 This fetches MoltenVK at MVK_MAIN into toolchain/src/MoltenVK (local changes and build output there are discarded),
 merges the pull request's commit MVK_PR, pins SPIRV-Cross at SPIRV_CROSS (its mesh shader fixes, KhronosGroup/SPIRV-Cross
-pull request 2686, came after the revision MoltenVK pins), and builds with MoltenVK's own fetchDependencies and Makefile
+pull request 2686, came after the revision MoltenVK pins), applies PATCHES, and builds with MoltenVK's own fetchDependencies and Makefile
 (Xcode). The build fetches MoltenVK's dependencies (SPIRV-Cross, SPIRV-Tools, SPIRV-Headers, Vulkan-Headers, cereal)
 from GitHub. libMoltenVK.dylib, its ICD manifest (MoltenVK_icd.json, naming the library by a relative path) and
 MoltenVK's LICENSE go to toolchain/moltenvk; with --install GAME they are copied to GAME/moltenvk, where the game's
@@ -32,6 +33,336 @@ MVK_PR_REF = 'pull/2842/head'
 SPIRV_CROSS = '57e4efcc84112abcd426dc5ec248b5339bee04f2'  # SPIRV-Cross main, 2026-10-28, with pull request 2686
 LIB = 'Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib'
 
+# Changes made to the merged source, as (file, text, replacement); each text must occur once.
+#
+# Mesh draws without a task shader, in blocks of 1024 mesh threadgroups. Metal launches a mesh grid from an object
+# threadgroup, and one object threadgroup launches at most 1024 mesh threadgroups; a larger grid failed the command
+# buffer ("Insufficient Memory") and the device was lost. The game's foliage draws up to about 1,800 workgroups without a
+# task shader. A pipeline with a mesh shader and no task shader gets MoltenVK's own object function on every Apple GPU
+# (not only those without indirect mesh draws). A draw launches MESH_BLOCKS object threadgroups (a direct draw: as many
+# as its count needs); threadgroup k launches workgroups [1024 k, 1024 k + 1024) of the draw's count and writes 1024 k into
+# its payload, and the game's mesh shaders, as our translator writes them for macOS (tools/xlate/MeshSpirv.cs), add that
+# base to their workgroup ID. A grid of more than one row is one block, clamped to 1024.
+SHADERS = 'MoltenVK/MoltenVK/Commands/MVKCommandPipelineStateFactoryShaderSource.h'
+PIPELINE = 'MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm'
+DRAW = 'MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm'
+MESH_BLOCKS = 8   # indirect draws: up to 8192 workgroups
+MSL_VERSION = 3   # one more with each change to SPIRV_CROSS_PATCHES: 1 mesh positions flipped, 2 outputs per thread,
+                  # 3 unwritten fragment inputs
+PATCHES = [
+    (SHADERS,
+     '[[object]] void objCmdDrawMeshTasks(const device MTLDispatchThreadgroupsIndirectArguments& args [[buffer(0)]],\n'
+     '                                    mesh_grid_properties grid) {\n'
+     '\tgrid.set_threadgroups_per_grid(uint3(args.threadgroupsPerGrid[0], args.threadgroupsPerGrid[1], '
+     'args.threadgroupsPerGrid[2]));\n'
+     '}',
+     '[[object]] void objCmdDrawMeshTasks(const device MTLDispatchThreadgroupsIndirectArguments& args [[buffer(0)]],\n'
+     '                                    object_data uint& base [[payload]],\n'
+     '                                    uint block [[threadgroup_position_in_grid]],\n'
+     '                                    mesh_grid_properties grid) {\n'
+     '\tuint3 g = uint3(args.threadgroupsPerGrid[0], args.threadgroupsPerGrid[1], args.threadgroupsPerGrid[2]);\n'
+     '\tif (g.y * g.z != 1u) {\n'
+     '\t\tbase = 0u;\n'
+     '\t\tif (block != 0u) { g = uint3(0u); }\n'
+     '\t\telse if (g.x * g.y * g.z > 1024u) { g = uint3(min(g.x, 1024u), min(g.y, 1024u / max(min(g.x, 1024u), 1u)), 1u); }\n'
+     '\t\tgrid.set_threadgroups_per_grid(g);\n'
+     '\t\treturn;\n'
+     '\t}\n'
+     '\tuint first = block * 1024u;\n'
+     '\tbase = first;\n'
+     '\tgrid.set_threadgroups_per_grid(uint3(g.x > first ? min(g.x - first, 1024u) : 0u, 1u, 1u));\n'
+     '}'),
+    (PIPELINE,
+     '\t} else if ( !getPhysicalDevice()->getMTLDeviceCapabilities().supportsApple9 ) {\n'
+     '\t\t// without indirect mesh draws, an object function reads each draw\'s mesh grid from a buffer\n'
+     '\t\tplDesc.objectFunction = [factory->newFunctionNamed("objCmdDrawMeshTasks") autorelease];\n'
+     '\t\t_hasMeshGridObject = true;\n'
+     '\t}',
+     '\t} else {\n'
+     '\t\t// an object function reads each draw\'s mesh grid from a buffer and launches it in blocks of 1024 mesh\n'
+     '\t\t// threadgroups, the block\'s first workgroup in its payload\n'
+     '\t\tplDesc.objectFunction = [factory->newFunctionNamed("objCmdDrawMeshTasks") autorelease];\n'
+     '\t\tplDesc.payloadMemoryLength = 16;\n'
+     '\t\t_hasMeshGridObject = true;\n'
+     '\t}'),
+    (DRAW,
+     '\t\tcmdEncoder->getMtlGraphics().bindObjectBytes(cmdEncoder->_mtlRenderEncoder, grid, sizeof(grid), 0);\n'
+     '\t\tgroupCount = MTLSizeMake(1, 1, 1);',
+     '\t\tcmdEncoder->getMtlGraphics().bindObjectBytes(cmdEncoder->_mtlRenderEncoder, grid, sizeof(grid), 0);\n'
+     '\t\tgroupCount = MTLSizeMake(grid[1] * grid[2] == 1 ? (grid[0] + 1023) / 1024 : 1, 1, 1);'),
+    (DRAW,
+     '\t\t\tcmdEncoder->getMtlGraphics().bindObjectBuffer(cmdEncoder->_mtlRenderEncoder, indirectBuffer, '
+     'indirectBufferOffset + drawIdx * indirectBufferStride, 0);\n'
+     '\t\t\t[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake(1, 1, 1)',
+     '\t\t\tcmdEncoder->getMtlGraphics().bindObjectBuffer(cmdEncoder->_mtlRenderEncoder, indirectBuffer, '
+     'indirectBufferOffset + drawIdx * indirectBufferStride, 0);\n'
+     f'\t\t\t[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake({MESH_BLOCKS}, 1, 1)'),
+    # Task shaders on Apple7 and Apple8 GPUs (the M1 and M2). MoltenVK offers them from Apple9 on only, on the grounds
+    # that the older GPUs have no indirect mesh draw. They have one for an object grid: on an M1 Max (Apple7),
+    # drawMeshThreadgroupsWithIndirectBuffer with an object function launched exactly the grid in the buffer (0, 1, 64,
+    # 1024, 3880, 70000 threadgroups and a 300x4x2 grid, counted by the object and mesh functions; 2026-11-10), which
+    # is how MoltenVK draws an indirect task draw. The mesh grid each task workgroup launches stays within 1024: the
+    # game's task shaders, as our translator writes them, clamp their mesh count to their thread count.
+    ('MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm',
+     '\t\t\t\t// without indirect mesh draws, indirect task draws have no stage left to read their grid\n'
+     '\t\t\t\tmeshFeatures->taskShader = _gpuCapabilities.supportsApple9;\n',
+     '\t\t\t\t// Apple7 and Apple8 launch an object grid read from a buffer too (drawMeshThreadgroupsWithIndirectBuffer)\n'
+     '\t\t\t\tmeshFeatures->taskShader = _gpuCapabilities.supportsApple7;\n'),
+    # The mesh stage's shared memory limit, with its outputs out of threadgroup memory (SPIRV_CROSS_PATCHES): all of
+    # Metal's 32768 bytes but the 8 of the vertex and primitive counts, instead of half of what a worst case of outputs
+    # left (12284). A shader whose outputs stay in threadgroup memory (an output block) and that goes over fails at
+    # pipeline creation.
+    ('MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm',
+     '\t\t\t\tuint32_t meshShared = (lim.maxComputeSharedMemorySize - sizeof(uint32_t[2]) - meshPrims * sizeof(uint32_t[4])) / 2;\n',
+     '\t\t\t\tuint32_t meshShared = lim.maxComputeSharedMemorySize - sizeof(uint32_t[2]);\n'),
+    # SPIRV_CROSS_PATCHES change the MSL of shaders the pipeline cache may hold from an earlier build, keyed by their
+    # SPIR-V and options only: another cache UUID makes the driver refuse such a cache.
+    ('MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm',
+     '\tmtlFeatures |= _isUsingMetalArgumentBuffers << 0;\n',
+     '\tmtlFeatures |= _isUsingMetalArgumentBuffers << 0;\n'
+     f'\tmtlFeatures |= {MSL_VERSION}u << 9;\t// the MSL the patched SPIRV-Cross writes\n'),
+    # fetchDependencies checks out each dependency at its revision with --force, which would drop SPIRV_CROSS_PATCHES:
+    # a repository already at its revision is left as it is (build() resets SPIRV-Cross itself before patching it).
+    ('fetchDependencies',
+     '\t\tgit cat-file -e $3 || git fetch --all\n'
+     '\t\tgit checkout --force $3\n',
+     '\t\tgit cat-file -e $3 || git fetch --all\n'
+     '\t\t[ "$(git rev-parse HEAD)" = "$(git rev-parse $3^{commit})" ] || git checkout --force $3\n'),
+    # Buffers read through device addresses. With a residency set, every buffer's memory is in it from its creation
+    # (makeResident), and the queue uses the set for each command buffer. MoltenVK also added every buffer made with
+    # device address usage to each encoder's useResources, whether the submission reads it or not: over 4,000 of the
+    # game's pool buffers each time, unbound ones as nil entries, and a buffer destroyed while such a command buffer
+    # ran failed it ("Invalid Resource"). With a residency set that list is not encoded.
+    ('MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm',
+     'void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {\n'
+     '\tlock_guard<mutex> lock(_rezLock);\n',
+     'void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {\n'
+     '\tif (hasResidencySet()) { return; }\n'
+     '\tlock_guard<mutex> lock(_rezLock);\n'),
+]
+
+
+# Changes made to SPIRV-Cross (External/SPIRV-Cross, checked out at SPIRV_CROSS by fetchDependencies), as PATCHES; build()
+# applies them between the checkout and the build.
+#
+# Mesh shader positions flipped for Metal. MoltenVK asks SPIRV-Cross to negate each vertex's y (Vulkan's clip space
+# points y down, Metal's up), and the mesh stage did so only for a position that is a member of an output block. Our
+# translator declares the mesh stage's gl_Position as an array variable of its own (tools/xlate/MeshSpirv.cs), so every
+# vertex of the game's mesh shaders came out mirrored top to bottom, with its winding reversed: foliage hanging from
+# the sky, rocks in the air, a door culled inside out.
+SPIRV_CROSS_PATCHES = [
+    ('spirv_msl.cpp',
+     '\t\t\tBuiltIn builtin = BuiltInMax;\n'
+     '\t\t\tstd::string access;\n'
+     '\t\t\tif (orig_type.basetype == SPIRType::Struct)\n',
+     '\t\t\tBuiltIn builtin = BuiltInMax;\n'
+     '\t\t\tstd::string access;\n'
+     '\t\t\t// a position declared as a variable of its own, not as a member of a block, is flipped too\n'
+     '\t\t\tif (orig_type.basetype != SPIRType::Struct && has_decoration(orig_var, DecorationBuiltIn) &&\n'
+     '\t\t\t    BuiltIn(get_decoration(orig_var, DecorationBuiltIn)) == BuiltInPosition)\n'
+     '\t\t\t\tbuiltin = BuiltInPosition;\n'
+     '\t\t\tif (orig_type.basetype == SPIRType::Struct)\n'),
+    # Mesh shader outputs kept by each thread instead of in threadgroup memory. Metal allows a mesh function 32768 bytes
+    # of threadgroup memory in all (a pipeline over it fails at its creation: "Threadgroup memory size (N) exceeds the
+    # maximum threadgroup memory allowed (32768)"; measured on an M1 Max, the sum of the function's threadgroup
+    # variables that its fragment function leaves alive). SPIRV-Cross keeps every output array there, 16 bytes per
+    # vector, vertex and primitive, beside the shader's own shared memory: the game's larger foliage shaders (160
+    # vertices, nine vectors, 13008 to 17040 bytes of shared memory) came to 34520 to 47256 bytes and were not drawn.
+    # An output array that is not a block, in a shader with a literal workgroup size of T threads, becomes a
+    # spvMeshThreadArray: each thread holds elements t, t + T, t + 2T, ..., the ones the entry point's last loops hand
+    # to the mesh from that thread. Our translator's mesh entry writes each vertex and primitive from that same
+    # thread (tools/xlate/MeshSpirv.cs: "every thread copies vertices i, i + threads, ..."); a shader that writes
+    # another thread's element would lose it. The whole array as a local of each thread was seven times slower (21 ms
+    # against 3 for 8192 mesh threadgroups); the per-thread part is as fast as threadgroup memory.
+    ('spirv_msl.cpp',
+     '\t\t\t\tfunc.add_parameter(type_id, next_id, true);\n'
+     '\t\t\t\tauto &v = set<SPIRVariable>(next_id, type_id, StorageClassFunction, 0, arg_id);\n'
+     '\t\t\t\tv.storage = StorageClassWorkgroup;\n'
+     '\n'
+     '\t\t\t\t// Ensure the existing variable has a valid name and the new variable has all the same meta info\n',
+     '\t\t\t\tfunc.add_parameter(type_id, next_id, true);\n'
+     '\t\t\t\tauto &v = set<SPIRVariable>(next_id, type_id, StorageClassFunction, 0, arg_id);\n'
+     '\t\t\t\tif (mesh_output_thread_step(arg_id) == 0)\n'
+     '\t\t\t\t\tv.storage = StorageClassWorkgroup;\n'
+     '\n'
+     '\t\t\t\t// Ensure the existing variable has a valid name and the new variable has all the same meta info\n'),
+    ('spirv_msl.cpp',
+     '\t\t{\n'
+     '\t\tcase SPVFuncImplUnsafeArray:\n'
+     '\t\t\tstatement("template<typename T, size_t Num>");\n'
+     '\t\t\tstatement("struct spvUnsafeArray");\n',
+     '\t\t{\n'
+     '\t\tcase SPVFuncImplUnsafeArray:\n'
+     '\t\t\tif (get_execution_model() == ExecutionModelMeshEXT)\n'
+     '\t\t\t{\n'
+     "\t\t\t\t// One thread's part of an output array: elements t, t + Step, t + 2 * Step, ... of Num.\n"
+     '\t\t\t\tstatement("template<typename T, size_t Num, size_t Step>");\n'
+     '\t\t\t\tstatement("struct spvMeshThreadArray");\n'
+     '\t\t\t\tbegin_scope();\n'
+     '\t\t\t\tstatement("T elements[(Num + Step - 1) / Step];");\n'
+     '\t\t\t\tstatement("");\n'
+     '\t\t\t\tstatement("thread T& operator [] (size_t pos) thread");\n'
+     '\t\t\t\tbegin_scope();\n'
+     '\t\t\t\tstatement("return elements[pos / Step];");\n'
+     '\t\t\t\tend_scope();\n'
+     '\t\t\t\tstatement("constexpr const thread T& operator [] (size_t pos) const thread");\n'
+     '\t\t\t\tbegin_scope();\n'
+     '\t\t\t\tstatement("return elements[pos / Step];");\n'
+     '\t\t\t\tend_scope();\n'
+     '\t\t\t\tend_scope_decl();\n'
+     '\t\t\t\tstatement("");\n'
+     '\t\t\t}\n'
+     '\t\t\tstatement("template<typename T, size_t Num>");\n'
+     '\t\t\tstatement("struct spvUnsafeArray");\n'),
+    ('spirv_msl.cpp',
+     '}\n'
+     '\n'
+     '// Metal leaves these undefined when a mesh shader omits them, while Vulkan defines them when they are not written.\n'
+     'bool CompilerMSL::is_mesh_output_with_default(BuiltIn builtin, StorageClass storage) const\n',
+     '}\n'
+     '\n'
+     "// A mesh shader's output array that is not a block is kept by each thread for itself, in a spvMeshThreadArray: thread t\n"
+     '// of T holds elements t, t + T, t + 2T, ... (the vertices and primitives this thread hands to the mesh at the end of\n'
+     '// the entry point), so the array takes no threadgroup memory. The shader must write and read an element from the thread\n'
+     '// that owns it. Returns T for such a variable (or a function parameter standing for it), else 0.\n'
+     'uint32_t CompilerMSL::mesh_output_thread_step(uint32_t id) const\n'
+     '{\n'
+     '\tif (!is_mesh_shader())\n'
+     '\t\treturn 0;\n'
+     '\tauto *var = maybe_get<SPIRVariable>(id);\n'
+     '\twhile (var && var->basevariable && var->basevariable != var->self)\n'
+     '\t\tvar = maybe_get<SPIRVariable>(var->basevariable);\n'
+     "\t// the pointer type tells: a declaration as a function local changes the variable's own storage class for a while\n"
+     '\tif (!var || get<SPIRType>(var->basetype).storage != StorageClassOutput)\n'
+     '\t\treturn 0;\n'
+     '\tauto &type = get_variable_data_type(*var);\n'
+     '\tif (type.array.size() != 1 || type.basetype == SPIRType::Struct)\n'
+     '\t\treturn 0;\n'
+     '\tauto &execution = get_entry_point();\n'
+     '\t// only a literal workgroup size: the step is written into the type\n'
+     '\tif (execution.flags.get(ExecutionModeLocalSizeId) || !execution.flags.get(ExecutionModeLocalSize))\n'
+     '\t\treturn 0;\n'
+     '\treturn execution.workgroup_size.x * execution.workgroup_size.y * execution.workgroup_size.z;\n'
+     '}\n'
+     '\n'
+     '// Metal leaves these undefined when a mesh shader omits them, while Vulkan defines them when they are not written.\n'
+     'bool CompilerMSL::is_mesh_output_with_default(BuiltIn builtin, StorageClass storage) const\n'),
+    ('spirv_msl.cpp',
+     '\n'
+     '\t\tif (is_mesh_shader())\n'
+     '\t\t\taddr_space = "threadgroup";\n'
+     '\t\tbreak;\n'
+     '\n',
+     '\n'
+     '\t\tif (is_mesh_shader())\n'
+     '\t\t\taddr_space = mesh_output_thread_step(id) ? "thread" : "threadgroup";\n'
+     '\t\tbreak;\n'
+     '\n'),
+    ('spirv_msl.cpp',
+     '\t\tstring sizes;\n'
+     '\n'
+     '\t\tfor (uint32_t i = 0; i < uint32_t(type.array.size()); i++)\n'
+     '\t\t{\n'
+     '\t\t\tres += "spvUnsafeArray<";\n'
+     '\t\t\tsizes += ", ";\n'
+     '\t\t\tsizes += to_array_size(type, i);\n'
+     '\t\t\tsizes += ">";\n'
+     '\t\t}\n',
+     '\t\tstring sizes;\n'
+     '\n'
+     '\t\tuint32_t thread_step = mesh_output_thread_step(id);\n'
+     '\t\tfor (uint32_t i = 0; i < uint32_t(type.array.size()); i++)\n'
+     '\t\t{\n'
+     '\t\t\tres += thread_step ? "spvMeshThreadArray<" : "spvUnsafeArray<";\n'
+     '\t\t\tsizes += ", ";\n'
+     '\t\t\tsizes += to_array_size(type, i);\n'
+     '\t\t\tif (thread_step)\n'
+     '\t\t\t\tsizes += join(", ", thread_step);\n'
+     '\t\t\tsizes += ">";\n'
+     '\t\t}\n'),
+    ('spirv_msl.cpp',
+     '\n'
+     '\t\tif (is_mesh_shader())\n'
+     '\t\t\treturn variable.storage == StorageClassOutput;\n'
+     '\n'
+     '\t\treturn variable.storage == StorageClassOutput && is_tesc_shader() && is_stage_output_variable_masked(variable);\n',
+     '\n'
+     '\t\tif (is_mesh_shader())\n'
+     '\t\t\treturn variable.storage == StorageClassOutput && mesh_output_thread_step(variable.self) == 0;\n'
+     '\n'
+     '\t\treturn variable.storage == StorageClassOutput && is_tesc_shader() && is_stage_output_variable_masked(variable);\n'),
+    ('spirv_msl.hpp',
+     '\tbool is_tese_shader() const;\n'
+     '\tbool is_mesh_shader() const;\n'
+     '\tbool is_mesh_output_with_default(BuiltIn builtin, StorageClass storage) const;\n'
+     '\tbool is_64bit_integer_interface(const SPIRType &type) const;\n',
+     '\tbool is_tese_shader() const;\n'
+     '\tbool is_mesh_shader() const;\n'
+     '\tuint32_t mesh_output_thread_step(uint32_t id) const;\n'
+     '\tbool is_mesh_output_with_default(BuiltIn builtin, StorageClass storage) const;\n'
+     '\tbool is_64bit_integer_interface(const SPIRType &type) const;\n'),
+    # Fragment inputs the stage before does not write read as zero. The game draws one mesh program (position and one
+    # vector) with a fragment program that also reads three flat vectors: Metal's compiler ended on a null pointer
+    # building that pipeline (MTLCompilerService in AGCLLVMUserMeshShaderSW::getBasePointer, reported to the game as
+    # XPC_ERROR_CONNECTION_INTERRUPTED), and with a vertex function Metal refuses such a pipeline. MoltenVK tells the
+    # fragment conversion which locations the stage before writes; an input at another location is left out of the
+    # stage-in struct and becomes a zero local, which is what an unwritten varying reads on the console's GPU.
+    ('spirv_msl.cpp',
+     '\t}\n'
+     '\n'
+     '\t// Holds SetMeshOutputsEXT information. Threadgroup since first thread wins.\n'
+     '\tif (processing_entry_point && is_mesh_shader())\n',
+     '\t}\n'
+     '\n'
+     '\tstd::sort(unfed_frag_inputs.begin(), unfed_frag_inputs.end());\n'
+     '\tfor (uint32_t var_id : unfed_frag_inputs)\n'
+     '\t{\n'
+     '\t\tauto &var = get<SPIRVariable>(var_id);\n'
+     '\t\tadd_local_variable_name(var_id);\n'
+     '\t\tstatement(CompilerGLSL::variable_decl(var), " = {};");\n'
+     '\t\tvar.deferred_declaration = false;\n'
+     '\t}\n'
+     '\n'
+     '\t// Holds SetMeshOutputsEXT information. Threadgroup since first thread wins.\n'
+     '\tif (processing_entry_point && is_mesh_shader())\n'),
+    ('spirv_msl.cpp',
+     '\t\t}\n'
+     '\n'
+     '\t\t// Barycentric inputs must be emitted in stage-in, because they can have interpolation arguments.\n'
+     '\t\tif (is_active && (bi_type == BuiltInBaryCoordKHR || bi_type == BuiltInBaryCoordNoPerspKHR))\n',
+     '\t\t}\n'
+     '\n'
+     '\t\t// A fragment input at a location the stage before does not write, where the pipeline told which it writes: it is\n'
+     "\t\t// left out of the stage-in struct and reads as zero. Metal's compiler otherwise fails the pipeline, or with a\n"
+     '\t\t// mesh function before it ends on a null pointer (AGX, macOS 27).\n'
+     '\t\tif (get_execution_model() == ExecutionModelFragment && storage == StorageClassInput && !patch && !is_builtin &&\n'
+     '\t\t    !is_block && is_active && !hidden && !inputs_by_location.empty() &&\n'
+     '\t\t    has_decoration(var_id, DecorationLocation) && type.basetype != SPIRType::Struct && type.array.empty() &&\n'
+     '\t\t    type.columns == 1)\n'
+     '\t\t{\n'
+     '\t\t\tbool fed = false;\n'
+     '\t\t\tfor (auto &input : inputs_by_location)\n'
+     '\t\t\t\tfed = fed || input.first.location == location;\n'
+     '\t\t\tif (!fed)\n'
+     '\t\t\t{\n'
+     '\t\t\t\thidden = true;\n'
+     '\t\t\t\tunfed_frag_inputs.push_back(var_id);\n'
+     '\t\t\t}\n'
+     '\t\t}\n'
+     '\n'
+     '\t\t// Barycentric inputs must be emitted in stage-in, because they can have interpolation arguments.\n'
+     '\t\tif (is_active && (bi_type == BuiltInBaryCoordKHR || bi_type == BuiltInBaryCoordNoPerspKHR))\n'),
+    ('spirv_msl.hpp',
+     '\n'
+     '\tSmallVector<uint32_t> disabled_frag_outputs;\n'
+     '\n'
+     '\tstd::unordered_set<SetBindingPair, InternalHasher> inline_uniform_blocks;\n',
+     '\n'
+     '\tSmallVector<uint32_t> disabled_frag_outputs;\n'
+     '\tSmallVector<uint32_t> unfed_frag_inputs;\n'
+     '\n'
+     '\tstd::unordered_set<SetBindingPair, InternalHasher> inline_uniform_blocks;\n'),
+]
 
 def git(src, *args, capture=False):
     r = subprocess.run(['git', '-C', str(src), *args], check=True, text=True, capture_output=capture)
@@ -54,13 +385,34 @@ def fetch(src):
     git(src, 'clean', '-qfdx', '-e', 'External/')   # External/: the fetched dependencies, kept between builds
     git(src, '-c', 'user.name=build_moltenvk', '-c', 'user.email=build@localhost', 'merge', '-q', '--no-edit', MVK_PR)
     (src / 'ExternalRevisions' / 'SPIRV-Cross_repo_revision').write_text(SPIRV_CROSS + '\n')
+    apply(src, PATCHES)
+
+
+def apply(root, patches):
+    for name, text, new in patches:
+        f = root / name
+        body = f.read_text()
+        if body.count(text) != 1:
+            sys.exit(f'build_moltenvk: {name}: the text to patch occurs {body.count(text)} times')
+        f.write_text(body.replace(text, new))
+
+
+def run(src, *cmd):
+    print('build_moltenvk:', ' '.join(cmd), flush=True)
+    if subprocess.run(cmd, cwd=src).returncode:
+        sys.exit(f'build_moltenvk: {" ".join(cmd)} failed')
 
 
 def build(src):
-    for cmd in (['./fetchDependencies', '--macos'], ['make', 'macos']):
-        print('build_moltenvk:', ' '.join(cmd), flush=True)
-        if subprocess.run(cmd, cwd=src).returncode:
-            sys.exit(f'build_moltenvk: {" ".join(cmd)} failed')
+    # SPIRV-Cross is patched between its checkout (fetchDependencies --none fetches only) and its build (the patched
+    # fetchDependencies leaves a repository at its revision as it is).
+    sc = src / 'External' / 'SPIRV-Cross'
+    if (sc / '.git').is_dir():
+        git(sc, 'checkout', '-q', '--force', SPIRV_CROSS)   # drops an earlier build's patches
+    run(src, './fetchDependencies', '--none')
+    apply(sc, SPIRV_CROSS_PATCHES)
+    run(src, './fetchDependencies', '--macos')
+    run(src, 'make', 'macos')
     lib = src / LIB
     if not lib.is_file():
         sys.exit(f'build_moltenvk: {lib} was not built')
@@ -74,7 +426,8 @@ def stage(src, out):
     icd = {'file_format_version': '1.0.0',
            'ICD': {'library_path': './libMoltenVK.dylib', 'api_version': '1.4.0', 'is_portability_driver': True}}
     (out / 'MoltenVK_icd.json').write_text(json.dumps(icd, indent=4) + '\n')
-    (out / 'VERSION.txt').write_text(f'MoltenVK {MVK_MAIN} + pull request 2842 {MVK_PR}; SPIRV-Cross {SPIRV_CROSS}\n')
+    (out / 'VERSION.txt').write_text(f'MoltenVK {MVK_MAIN} + pull request 2842 {MVK_PR}; SPIRV-Cross {SPIRV_CROSS}; '
+                                     f'{len(PATCHES)} local patches, {len(SPIRV_CROSS_PATCHES)} to SPIRV-Cross\n')
 
 
 def main():

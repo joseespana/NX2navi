@@ -112,6 +112,14 @@ def shader_cases() -> list[tuple[str, list[int], dict]]:
                   {"sm86": True, "stage": "ms", "mesh": {"stage": 7, "threads": 32, "maxv": 1,
                    "maxp": 1, "topo": 1, "payload": 0, "task": False},
                    "_check": {"lowered": [0xef48000000000000 | PT | (255 << 8) | (4 << 48)]}}))
+    # A mesh shader without a task stage that reads its workgroup ID (S2R R0, SR_CTAID.X; STS [RZ], R0). On macOS the
+    # module also takes its block's first workgroup from a one-word payload (tools/xlate/MeshSpirv.cs): "mac_payload".
+    s2r = 0x919 | (7 << 12) | (0x25 << 72)
+    sts = 0x388 | (7 << 12) | (RZ << 24) | (4 << 73)
+    cases.append(("mesh_ctaid", [s2r, sts],
+                  {"sm86": True, "stage": "ms", "mesh": {"stage": 7, "threads": 32, "maxv": 1,
+                   "maxp": 1, "topo": 1, "payload": 0, "task": False},
+                   "_check": {"lowered": [0xf0c8000000000000 | PT | (0x25 << 20)], "mac_payload": True}}))
     return cases
 
 
@@ -438,6 +446,16 @@ def main() -> int:
             print(f"{job['key']}: spirv-val exit {v.returncode} ({len(data)} bytes) {v.stdout}{v.stderr}")
             if v.returncode:
                 return v.returncode
+            if checks[job["key"]].get("mac_payload") and sys.platform == "darwin":
+                words = struct.unpack(f"<{len(data) // 4}I", data)
+                at, payloads = 5, 0
+                while at < len(words):   # OpVariable (59) in TaskPayloadWorkgroupEXT (5402)
+                    n, op = words[at] >> 16, words[at] & 0xFFFF
+                    payloads += op == 59 and n >= 4 and words[at + 3] == 5402
+                    at += max(n, 1)
+                if payloads != 1:
+                    print(f"{job['key']}: {payloads} payload variables, 1 expected on macOS", file=sys.stderr)
+                    return 1
             if checks[job["key"]]:
                 lowered = Path(job["lowered_out"]).read_bytes()[0 if "mesh" in job else 0x50:]
                 words = [word[0] for i, word in enumerate(struct.iter_unpack("<Q", lowered)) if i % 4]

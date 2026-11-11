@@ -349,7 +349,7 @@ static int create_device(void) {
     // Such a driver's device must be created with this extension when it has it.
     int subset = has_ext(ep, ne, "VK_KHR_portability_subset");
     if (subset) ext[n_ext++] = "VK_KHR_portability_subset";
-    g_vk.image_bytes_apart = subset;
+    g_vk.image_bytes_apart = g_vk.late_completion = subset;
     OPTIONAL_EXT(has_custom_border_color, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, cbc, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
     OPTIONAL_EXT(has_eds, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, eds, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT);
     OPTIONAL_EXT(has_eds2, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, eds2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT);
@@ -488,6 +488,12 @@ static int create_device(void) {
         g_vk.has_mesh_queries = want && c->mesh.meshShaderQueries && h->pipelineStatisticsQuery && c->f12.hostQueryReset;
         c->mesh.meshShaderQueries = g_vk.has_mesh_queries ? VK_TRUE : VK_FALSE;
         g_vk.has_task_shader = c->mesh.taskShader;
+        if (g_vk.image_bytes_apart) {   // a portability driver: its mesh stage limits are checked per pipeline
+            VkPhysicalDeviceMeshShaderPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &mp};
+            vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+            g_vk.mesh_shared_max = mp.maxMeshSharedMemorySize, g_vk.task_shared_max = mp.maxTaskSharedMemorySize;
+        }
         // A portability driver may offer mesh shaders without the task stage (MoltenVK on Apple7 and Apple8 GPUs: Metal
         // has no indirect mesh dispatch there): programs without a task stage are drawn, the others skipped. Elsewhere
         // both stages stay required, as before.

@@ -4947,7 +4947,7 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     }
     if (!fn) return warn_once(W_MESH, "mesh draws need VK_EXT_mesh_shader: skipped");
     static int on = -1;
-    if (on < 0) on = rt_knob("MESH", "1");
+    if (on < 0) on = rt_knob("MESH", "1") && rt_knob("MESH_IND", "1");   // NX2NAVI_MESH_IND=0: indirect ones only
     if (!on) return;
     VkMemSpan ip;
     if (!vk_mem_resolve(d->ind, 12, &ip) || ip.offset % 4)

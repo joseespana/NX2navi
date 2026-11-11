@@ -93,9 +93,83 @@ int vk_sync_wb_split(void) {
     return wb_split && exec_tl != VK_NULL_HANDLE;
 }
 
+// ---- fences for VkCtx.late_completion: each vkQueueSubmit2 that signals a timeline value carries a fence, kept here
+// with the newest value it signals. A fence is signalled once the driver is done with the command buffers, so the
+// value of the newest signalled fence bounds what may be destroyed (vk_sync_free_done). Pushed under the queue lock,
+// taken by the completion thread only; fr_lock guards the ring and the spare fences.
+static PlatMutex fr_lock = PLAT_MUTEX_INIT;
+static struct { VkFence f; uint64_t value; } *fr;
+static uint32_t fr_cap, fr_head, fr_n;
+static VkFence *fr_spare;
+static uint32_t fr_nspare, fr_capspare;
+static volatile uint64_t fr_done;     // the value of the newest signalled fence
+
+static VkFence fence_take(VkCtx *c, uint64_t value) {
+    if (!c->late_completion || !value) return VK_NULL_HANDLE;
+    plat_mutex_lock(&fr_lock);
+    VkFence f = VK_NULL_HANDLE;
+    if (fr_nspare) f = fr_spare[--fr_nspare];
+    else {
+        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(c->device, &fi, NULL, &f) != VK_SUCCESS) rt_fatal("vk: a submission fence");
+    }
+    if (fr_n == fr_cap) {
+        uint32_t cap = fr_cap ? fr_cap * 2 : 64;
+        void *n = malloc(sizeof *fr * cap);
+        if (!n) rt_fatal("vk: out of memory (submission fences)");
+        for (uint32_t i = 0; i < fr_n; i++) memcpy((char *)n + i * sizeof *fr, &fr[(fr_head + i) % fr_cap], sizeof *fr);
+        free(fr);
+        fr = n, fr_cap = cap, fr_head = 0;
+    }
+    fr[(fr_head + fr_n) % fr_cap].f = f, fr[(fr_head + fr_n) % fr_cap].value = value;
+    fr_n++;
+    plat_mutex_unlock(&fr_lock);
+    return f;
+}
+
+// Completion thread: the submissions up to `reached` on the timeline; waits for the fences of those that signal no
+// more than it (they come within a command buffer's completion of it) and returns the value of the newest one waited
+// for. A batch whose last value is past `reached` is waited for on a later call.
+static uint64_t fence_bound(VkCtx *c, uint64_t reached) {
+    if (!c->late_completion) return reached;
+    for (;;) {
+        plat_mutex_lock(&fr_lock);
+        if (!fr_n || fr[fr_head].value > reached) { plat_mutex_unlock(&fr_lock); break; }
+        VkFence f = fr[fr_head].f;
+        uint64_t v = fr[fr_head].value;
+        plat_mutex_unlock(&fr_lock);
+        VkResult r = vkWaitForFences(c->device, 1, &f, VK_TRUE, 10000000000ull);
+        if (r != VK_SUCCESS) {
+            vk_device_fault_report(r);
+            rt_fatal("vk: the wait for a submission's fence failed (%d; device lost?)", (int)r);
+        }
+        vkResetFences(c->device, 1, &f);
+        plat_mutex_lock(&fr_lock);
+        fr_head = (fr_head + 1) % fr_cap, fr_n--;
+        if (fr_nspare == fr_capspare) {
+            uint32_t cap = fr_capspare ? fr_capspare * 2 : 64;
+            VkFence *n = realloc(fr_spare, sizeof *n * cap);
+            if (!n) rt_fatal("vk: out of memory (submission fences)");
+            fr_spare = n, fr_capspare = cap;
+        }
+        fr_spare[fr_nspare++] = f;
+        plat_mutex_unlock(&fr_lock);
+        __atomic_store_n(&fr_done, v, __ATOMIC_RELEASE);
+    }
+    uint64_t d = __atomic_load_n(&fr_done, __ATOMIC_ACQUIRE);
+    return d < reached ? d : reached;
+}
+
+uint64_t vk_sync_free_done(uint64_t reached) {
+    const VkCtx *c = vk_ctx();
+    if (!c || !c->late_completion) return reached;
+    uint64_t d = __atomic_load_n(&fr_done, __ATOMIC_ACQUIRE);
+    return d < reached ? d : reached;
+}
+
 static void hold_flush_locked(VkCtx *c) {
     if (!H.n) return;
-    VkResult r = vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, VK_NULL_HANDLE);
+    VkResult r = vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, fence_take(c, H.last));
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of %d held submissions up to value %llu failed (%d)", H.n,
@@ -411,14 +485,22 @@ static void completion_main(void *arg) {
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
         }
-        while (fqn && fqueue[fqhead].fence <= reached) {
+        // What the callbacks free waits for the command buffers' completion too (VkCtx.late_completion); waiters
+        // (done) do not.
+        uint64_t freed = reached;
+        if (c->late_completion) {
+            plat_mutex_unlock(&st_lock);
+            freed = fence_bound(c, reached);
+            plat_mutex_lock(&st_lock);
+        }
+        while (fqn && fqueue[fqhead].fence <= freed) {
             Pending p = fqueue[fqhead++];
             fqn--;
             plat_mutex_unlock(&st_lock);
             p.fn(p.arg);
             plat_mutex_lock(&st_lock);
         }
-        while (qn && queue[qhead].fence <= reached) {
+        while (qn && queue[qhead].fence <= freed) {
             Pending p = queue[qhead++];
             qn--;
             plat_mutex_unlock(&st_lock);
@@ -463,6 +545,7 @@ void vk_sync_start(void) {
         }
         plat_mutex_lock(&st_lock);
         issued = done = now;
+        __atomic_store_n(&fr_done, now, __ATOMIC_RELEASE);
         if (reserved < now) reserved = now;
         stop = 0;
         plat_mutex_unlock(&st_lock);
@@ -486,6 +569,7 @@ void vk_sync_start(void) {
 static int claim_slot(VkCtx *c, uint64_t fence) {
     uint64_t gpu = 0;
     vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
+    gpu = vk_sync_free_done(gpu);   // VkCtx.late_completion: reset only once the driver is done with it
     for (int i = 0; i < nslots; i++)
         if (slots[i].fence <= gpu) {
             slots[i].fence = fence;
@@ -767,6 +851,13 @@ void vk_sync_shutdown(void) {
             vk_device_fault_report(res);
             rt_fatal("vk: shutdown device wait failed (%d)", (int)res);
         }
+        // The device is idle: every submission is done with (VkCtx.late_completion), and its fences go.
+        plat_mutex_lock(&fr_lock);
+        for (uint32_t i = 0; i < fr_n; i++) vkDestroyFence(c->device, fr[(fr_head + i) % fr_cap].f, NULL);
+        for (uint32_t i = 0; i < fr_nspare; i++) vkDestroyFence(c->device, fr_spare[i], NULL);
+        fr_n = fr_head = fr_nspare = 0;
+        __atomic_store_n(&fr_done, UINT64_MAX, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&fr_lock);
     }
     if (started) {
         plat_mutex_lock(&st_lock);

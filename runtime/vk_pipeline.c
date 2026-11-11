@@ -3702,6 +3702,53 @@ static void promote(Pipe *p) {
 
 // Enters a missing pipeline: built here (mode 0), or queued for a draw (1) or for the prebuild (2). Failures are
 // entered too. *queued: 1 when a job owns it. Caller holds P.lock.
+// Bytes of the module's Workgroup variables, for the translator's shared memory arrays of 32-bit words (MeshSpirv.cs:
+// one per mesh or task stage); UINT32_MAX when one is of another shape.
+static uint32_t spirv_workgroup_bytes(const GfxShader *sh) {
+    uint64_t words = 0;
+    const uint32_t *w = gfx_shader_spirv(sh, &words);
+    enum { OP_TYPE_INT = 21, OP_TYPE_FLOAT = 22, OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_CONSTANT = 43,
+           OP_VARIABLE = 59, SC_WORKGROUP = 4 };
+    if (!w || words < 5 || w[3] > (1u << 22)) return 0;
+    uint32_t bound = w[3], total = 0;
+    uint32_t *len = calloc(bound, sizeof *len), *pointee = calloc(bound, sizeof *pointee), *val = calloc(bound, sizeof *val);
+    uint8_t *word32 = calloc(bound, 1);
+    if (!len || !pointee || !val || !word32) total = UINT32_MAX;
+    for (uint64_t i = 5; total != UINT32_MAX && i < words;) {
+        uint32_t op = w[i] & 0xffff, n = w[i] >> 16;
+        if (!n || i + n > words) break;
+        const uint32_t *a = w + i + 1;
+        if ((op == OP_TYPE_INT || op == OP_TYPE_FLOAT) && n >= 3 && a[0] < bound) word32[a[0]] = a[1] == 32;
+        else if (op == OP_CONSTANT && n >= 4 && a[1] < bound) val[a[1]] = a[2];
+        else if (op == OP_TYPE_ARRAY && n >= 4 && a[0] < bound && a[1] < bound && a[2] < bound)
+            len[a[0]] = word32[a[1]] ? val[a[2]] : UINT32_MAX;
+        else if (op == OP_TYPE_POINTER && n >= 4 && a[0] < bound && a[1] == SC_WORKGROUP) pointee[a[0]] = a[2] + 1;
+        else if (op == OP_VARIABLE && n >= 4 && a[2] == SC_WORKGROUP && a[0] < bound && pointee[a[0]]) {
+            uint32_t t = pointee[a[0]] - 1, l = t < bound ? len[t] : UINT32_MAX;
+            total = !l || l == UINT32_MAX ? UINT32_MAX : total + 4 * l;
+        }
+        i += n;
+    }
+    free(len), free(pointee), free(val), free(word32);
+    return total;
+}
+
+// Whether the mesh and task stages' shared memory fits the driver's limits (VkCtx.mesh_shared_max, a portability
+// driver only). MoltenVK takes such a pipeline, and Metal then failed the command buffer that drew with it
+// ("Insufficient Memory") and the device was lost: Kokiri Forest's foliage has mesh stages of 15760 bytes against
+// 12284. A pipeline over the limit is not built; its draws are skipped.
+static int mesh_shared_fits(const VkPipeState *s, char *why, size_t cap) {
+    const VkCtx *c = vk_ctx();
+    if (!c->mesh_shared_max) return 1;
+    uint32_t m = spirv_workgroup_bytes(s->vs), t = s->ts ? spirv_workgroup_bytes(s->ts) : 0;
+    if (m > c->mesh_shared_max || (s->ts && c->task_shared_max && t > c->task_shared_max)) {
+        snprintf(why, cap, "shared memory over the driver's limit (mesh %u of %u bytes, task %u of %u)", m,
+                 c->mesh_shared_max, t, c->task_shared_max);
+        return 0;
+    }
+    return 1;
+}
+
 static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode, int *queued) {
     *queued = 0;
     const char *why = NULL;
@@ -3709,6 +3756,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     Layout *l = NULL;
     uint32_t span = binding_span(s->vs);
     int mesh = is_mesh(s);
+    char shared_why[96];
     if (mesh) {
         // Mesh draws (VK_EXT_mesh_shader): one set holding the mesh stage's bindings, the fragment stage's after them and
         // the task stage's after those (create_graphics renumbers both modules); no libraries (the GPL fast link is for
@@ -3717,6 +3765,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         uint32_t fspan = s->fs ? binding_span(s->fs) : 1;
         if (!vk_ctx()->has_mesh_shader) why = "the GPU has no mesh shaders";
         else if (s->ts && !vk_ctx()->has_task_shader) why = "the GPU has no task shaders";
+        else if (!mesh_shared_fits(s, shared_why, sizeof shared_why)) why = shared_why;
         else if ((s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) || (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS)) why = "stage mismatch";
         else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
                  (s->ts && !add_stage(&B, s->ts, span - 1 + fspan - 1))) why = "too many bindings";

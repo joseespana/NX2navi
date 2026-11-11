@@ -32,13 +32,13 @@ static class MeshSpirv
         OpTypeVector = 23, OpTypeArray = 28, OpTypePointer = 32, OpTypeFunction = 33, OpConstant = 43,
         OpFunction = 54, OpFunctionEnd = 56, OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62,
         OpAccessChain = 65, OpInBoundsAccessChain = 66, OpPtrAccessChain = 67, OpInBoundsPtrAccessChain = 70,
-        OpDecorate = 71, OpCompositeConstruct = 80, OpIAdd = 128, OpIMul = 132, OpULessThan = 176,
+        OpDecorate = 71, OpCompositeConstruct = 80, OpCompositeExtract = 81, OpCompositeInsert = 82, OpIAdd = 128, OpIMul = 132, OpULessThan = 176,
         OpShiftRightLogical = 194, OpBitwiseAnd = 199, OpBitcast = 124, OpControlBarrier = 224, OpSelectionMerge = 247,
         OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpReturn = 253,
         OpEmitMeshTasksEXT = 5294, OpSetMeshOutputsEXT = 5295;
-    const int ScUniform = 2, ScOutput = 3, ScWorkgroup = 4, ScInput = 1, ScFunction = 7, ScStorageBuffer = 12, ScTaskPayload = 5402;
-    const int DecBlock = 2, DecBufferBlock = 3, DecBuiltIn = 11, DecLocation = 30;
-    const int BiPosition = 0, BiPointSize = 1, BiLocalInvocationIndex = 29,
+    const int ScUniform = 2, ScOutput = 3, ScWorkgroup = 4, ScInput = 1, ScPrivate = 6, ScFunction = 7, ScStorageBuffer = 12, ScTaskPayload = 5402;
+    const int DecBlock = 2, DecBufferBlock = 3, DecBuiltIn = 11, DecInvariant = 18, DecLocation = 30;
+    const int BiPosition = 0, BiPointSize = 1, BiWorkgroupId = 26, BiLocalInvocationIndex = 29,
         BiPrimitivePointIndices = 5294, BiPrimitiveLineIndices = 5295, BiPrimitiveTriangleIndices = 5296;
     const int CapMeshShading = 5283, ModelTask = 5364, ModelMesh = 5365, ModelGLCompute = 5;
     const int ModeOutputVertices = 26, ModeOutputPoints = 27, ModeOutputLines = 5269, ModeOutputPrimitives = 5270,
@@ -209,6 +209,37 @@ static class MeshSpirv
             pPayloadUint = Ptr(ScTaskPayload, tUint);
         }
 
+        // macOS, a mesh stage without a task stage: Metal launches at most 1024 mesh workgroups from one object
+        // threadgroup, so the Vulkan driver there launches the draw in blocks of 1024 and gives each block's first
+        // workgroup in a payload of one word (the object function of tools/build_moltenvk.py). The game's code reads its
+        // workgroup ID from a private copy, set by the entry to the block's ID plus that base. Elsewhere the module is
+        // as before.
+        uint wgIn = 0, wgCopy = 0, wgType = 0, baseVar = 0;
+        if (m.Stage == 7 && !m.HasTask && OperatingSystem.IsMacOS())
+        {
+            var wgDec = ins.FirstOrDefault(i => i.Op == OpDecorate && i.W.Count >= 3 && i.W[1] == DecBuiltIn && i.W[2] == BiWorkgroupId);
+            var wgVarInsn = wgDec == null ? null : ins.FirstOrDefault(i => i.Op == OpVariable && i.W[1] == wgDec.W[0]);
+            if (wgVarInsn != null)
+            {
+                wgIn = wgVarInsn.W[1];
+                wgType = pointee[wgVarInsn.W[0]].type;
+                wgCopy = Var(Ptr(ScPrivate, wgType), ScPrivate);
+                var privPtrOf = new Dictionary<uint, uint>();
+                foreach (var i in ins)
+                {
+                    if (i.Op == OpLoad && i.W[2] == wgIn) i.W[2] = wgCopy;
+                    else if (i.Op is OpAccessChain or OpInBoundsAccessChain && i.W[2] == wgIn)
+                    {
+                        uint pe = pointee[i.W[0]].type;
+                        if (!privPtrOf.TryGetValue(pe, out uint pt)) privPtrOf[pe] = pt = Ptr(ScPrivate, pe);
+                        i.W[0] = pt;
+                        i.W[2] = wgCopy;
+                    }
+                }
+                baseVar = Var(Ptr(ScTaskPayload, tUint), ScTaskPayload);
+            }
+        }
+
         // ---- the entry function body
         var body = new List<Insn>();
         uint Emit(int op, uint type, params uint[] operands) { uint r = Id(); body.Add(new Insn(op, new[] { type, r }.Concat(operands))); return r; }
@@ -251,6 +282,14 @@ static class MeshSpirv
         uint entryFn = Id();
         body.Add(new Insn(OpFunction, new[] { tVoid, entryFn, 0u, tFnVoid }));
         Label();
+        if (wgCopy != 0)
+        {
+            uint wg = Emit(OpLoad, wgType, wgIn);
+            var wgVec = ins.Concat(globals).First(i => i.Op == OpTypeVector && i.W[0] == wgType);
+            uint elem = wgVec.W[1];
+            uint x = Emit(OpIAdd, elem, Emit(OpCompositeExtract, elem, wg, 0), Emit(OpLoad, tUint, baseVar));
+            Do(OpStore, wgCopy, Emit(OpCompositeInsert, wgType, x, wg, 0));
+        }
         uint tid = Emit(OpLoad, tUint, lii);
         // The counts start at 0: a task that culls everything never writes its mesh count, and the word then held what
         // the workgroup's shared memory last had, up to tens of thousands of mesh groups and a lost device; a mesh
@@ -280,7 +319,16 @@ static class MeshSpirv
             var generic = new Dictionary<int, uint>();
             foreach (int a in m.Lines)
             {
-                if (a >= 0x70 && a < 0x80 && posVar == 0) posVar = Var(Ptr(ScOutput, Arr(tV4, (uint)maxV)), ScOutput, BiPosition);
+                if (a >= 0x70 && a < 0x80 && posVar == 0)
+                {
+                    posVar = Var(Ptr(ScOutput, Arr(tV4, (uint)maxV)), ScOutput, BiPosition);
+                    // macOS: the game draws its foliage twice with two mesh shaders, a depth pass and a colour pass that
+                    // tests depth EQUAL, and relies on both computing the same depth. Metal keeps identical position
+                    // math identical only for an invariant position compiled with preserved invariance, which the
+                    // Vulkan driver there turns on for a module that marks its position Invariant. Without it the
+                    // colour pass misses its own depth at some pixels, which flash white for a frame.
+                    if (OperatingSystem.IsMacOS()) decorations.Add(new Insn(OpDecorate, new[] { posVar, (uint)DecInvariant }));
+                }
                 else if (a == 0x6c && sizeVar == 0) sizeVar = Var(Ptr(ScOutput, Arr(tFloat, (uint)maxV)), ScOutput, BiPointSize);
                 else if (a >= 0x80 && !generic.ContainsKey((a - 0x80) / 16))
                     generic[(a - 0x80) / 16] = Var(Ptr(ScOutput, Arr(tV4, (uint)maxV)), ScOutput, -1, (a - 0x80) / 16);

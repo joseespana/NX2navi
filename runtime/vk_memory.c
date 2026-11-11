@@ -111,6 +111,7 @@ static void shadow_forget(PoolRec *r);
 static void mirror_retiring(PoolRec *r);  // vk_pool_fini: kept until mirror_retire (or vk_mem_shutdown)
 static void mirror_retire(void *arg);    // completion thread: destroys a finalized mirrored pool's record
 static void grow(void **arr, int *cap, size_t elem);
+static void defer_pool_buffer(VkBuffer buf, VmaAllocation alloc);   // a mirror evicted (mirror_evict)
 
 static PlatMutex pool_lock = PLAT_MUTEX_INIT;
 // Bumped under pool_lock (exclusive) by every change to the index or a page table: vk_mem_resolve's per-thread hits
@@ -270,12 +271,100 @@ static PoolRec *phys_find(const pool_t *key) {
     return NULL;
 }
 
+// ---- pool buffers on a portability driver (VkCtx.late_completion)
+// The pools' buffers carry SHADER_DEVICE_ADDRESS usage (pool_usage). The Metal driver hands every live buffer made
+// with that usage to each encoder whose shaders use device addresses (one useResources call over all of them, about
+// 4000 in Ocarina), whether that submission reads the buffer or not, and Metal's command buffers there do not keep
+// what they use alive. So such a buffer destroyed, or the memory under it freed, while any command buffer encoded
+// during its life is still running fails that command buffer ("Invalid Resource", code 9; the device is lost: the
+// scene change after the Great Deku Tree, where many pools are finalized), and one destroyed while another thread
+// encodes a submission is a use after free inside the encoder. Waiting for the submissions that read it is not
+// enough, since every later submission names it too until it is gone. These objects go to a list instead and are
+// destroyed together with the queue's lock held and the queue idle, when no command buffer runs or is being
+// encoded (every submission takes that lock): at each pool finalize (vk_pool_fini waits for the queue there anyway),
+// and at a present once some have gathered (vk_mem_graves_present). Elsewhere they are destroyed as before.
+enum { GRAVE_BUF, GRAVE_BUF_VMA, GRAVE_MEM, GRAVE_MEM_VMA };
+typedef struct { int kind; uint64_t handle; VmaAllocation alloc; } Grave;
+static PlatMutex grave_lock = PLAT_MUTEX_INIT;
+static Grave *graves;
+static int ngrave, cgrave;
+static uint64_t grave_frame0;              // grave_lock: the present count when the oldest waiting one came
+static uint64_t grave_frame;               // the last present count vk_mem_graves_present saw
+static int graves_closed;                  // vk_mem_shutdown: the device is idle, objects go at once
+static uint64_t n_grave_flushes, n_grave_objs;
+
+static int graves_on(const VkCtx *c) { return c->late_completion && vk_gpa_wanted() && !graves_closed; }
+
+static void grave_destroy(VkCtx *c, const Grave *g) {
+    switch (g->kind) {
+    case GRAVE_BUF: vkDestroyBuffer(c->device, (VkBuffer)(uintptr_t)g->handle, NULL); break;
+    case GRAVE_BUF_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)g->handle, g->alloc); break;
+    case GRAVE_MEM: vkFreeMemory(c->device, (VkDeviceMemory)(uintptr_t)g->handle, NULL); break;
+    case GRAVE_MEM_VMA: vmaFreeMemory(c->vma, g->alloc); break;
+    }
+}
+
+// Destroys the object now, or (graves_on) lists it for the next idle queue. Objects of one pool are listed in the
+// order they are to be destroyed (a buffer before its memory).
+static void bury(VkCtx *c, int kind, uint64_t handle, VmaAllocation alloc) {
+    Grave g = {kind, handle, alloc};
+    if (!graves_on(c)) { grave_destroy(c, &g); return; }
+    plat_mutex_lock(&grave_lock);
+    if (ngrave == cgrave) grow((void **)&graves, &cgrave, sizeof *graves);
+    if (!ngrave) grave_frame0 = grave_frame;
+    graves[ngrave++] = g;
+    plat_mutex_unlock(&grave_lock);
+}
+
+// Destroys the listed objects with the queue idle: under the queue lock no submission is encoded, and once the queue
+// is idle none runs. Not for the completion thread (it never waits for the queue lock).
+static void graves_flush(VkCtx *c) {
+    plat_mutex_lock(&grave_lock);
+    int n = ngrave;
+    plat_mutex_unlock(&grave_lock);
+    if (!n) return;
+    vk_queue_lock();
+    VkResult res = vkQueueWaitIdle(c->gfx_queue);
+    if (res != VK_SUCCESS) {
+        vk_device_fault_report(res);
+        rt_fatal("vk: queue wait before destroying pool buffers failed (%d)", (int)res);
+    }
+    plat_mutex_lock(&grave_lock);
+    Grave *v = graves;
+    n = ngrave;
+    graves = NULL, ngrave = cgrave = 0;
+    plat_mutex_unlock(&grave_lock);
+    for (int i = 0; i < n; i++) grave_destroy(c, &v[i]);
+    vk_queue_unlock();
+    free(v);
+    n_grave_flushes++, n_grave_objs += (uint64_t)n;
+    static int big_logs;
+    if (n_grave_flushes <= 4 || n_grave_flushes % 256 == 0 || (n >= 4 && big_logs++ < 32))
+        rt_log("vk: %d pool buffer object(s) destroyed with the queue idle (%llu times, %llu objects so far)", n,
+               (unsigned long long)n_grave_flushes, (unsigned long long)n_grave_objs);
+}
+
+// At each present (vk_backend.c present_image, the submitting thread): what the completion thread and mirror
+// evictions listed goes once GRAVE_FRAMES presents passed since the oldest came, or GRAVE_MAX are waiting, so that a
+// queue drain comes at most that often.
+#define GRAVE_FRAMES 8
+#define GRAVE_MAX 64
+void vk_mem_graves_present(uint64_t frame) {
+    VkCtx *c = vk_ctx();
+    if (!c || !c->late_completion) return;
+    plat_mutex_lock(&grave_lock);
+    grave_frame = frame;
+    int due = ngrave && (ngrave >= GRAVE_MAX || frame - grave_frame0 >= GRAVE_FRAMES);
+    plat_mutex_unlock(&grave_lock);
+    if (due) graves_flush(c);
+}
+
 static void destroy_rec(VkCtx *c, PoolRec *r) {
-    if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
-    if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
-    if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
-    if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
-    if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
+    if (r->mbuf) bury(c, GRAVE_BUF_VMA, (uint64_t)(uintptr_t)r->mbuf, r->malloc_);
+    if (r->salloc) bury(c, GRAVE_BUF_VMA, (uint64_t)(uintptr_t)r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
+    if (r->buf) bury(c, GRAVE_BUF, (uint64_t)(uintptr_t)r->buf, NULL);
+    if (r->mem) bury(c, GRAVE_MEM, (uint64_t)(uintptr_t)r->mem, NULL);
+    if (r->alloc) bury(c, GRAVE_MEM_VMA, 0, r->alloc);
     for (uint32_t i = 0; i < r->csb; i++) free(r->sb[i].base);   // shadow base copies shadow_forget left (shutdown)
     free(r->sb), free(r->gw);
     free(r->cws);
@@ -405,8 +494,8 @@ void vk_pool_fini(pool_t *p) {
         // Replay was drained by the back end; the wait above also covered the flushed upload batches. Completion
         // callbacks (notably mirror verification) may still read guest bytes, so drain those before releasing the import.
         vk_sync_finish();
-        vkDestroyBuffer(c->device, r->buf, NULL);
-        vkFreeMemory(c->device, r->mem, NULL);
+        bury(c, GRAVE_BUF, (uint64_t)(uintptr_t)r->buf, NULL);
+        bury(c, GRAVE_MEM, (uint64_t)(uintptr_t)r->mem, NULL);
         r->buf = VK_NULL_HANDLE;
         r->mem = VK_NULL_HANDLE;
     }
@@ -420,6 +509,9 @@ void vk_pool_fini(pool_t *p) {
     // mark it used): its buffer outlives the submission being recorded too
     else if (r->kind == POOL_PHYS && !r->used) vk_completion_add(vk_sync_issued() + 1, gpa_retire, r);
     else destroy_rec(c, r);
+    // VkCtx.late_completion: what this and earlier finalizes listed goes now, with the queue idle (bury); a direct
+    // import's guest storage is released before Finalize returns, as above.
+    if (c->late_completion) graves_flush(c);
 }
 
 // pool_lock held: the device address table follows a MapVirtual request on [lo, hi) of virtual pool v. Ranges it
@@ -1855,7 +1947,7 @@ static uint64_t mirror_evict(uint64_t need, uint32_t min_idle, const char *why) 
                    (unsigned long long)r->size, (r->import_hi - r->import_lo) / 1048576.0, idle_for[n], why);
     }
     plat_mutex_unlock(&pool_lock);
-    for (int i = 0; i < n; i++) vk_defer_buffer(dead[i], dead_a[i]);   // after the submission being recorded
+    for (int i = 0; i < n; i++) defer_pool_buffer(dead[i], dead_a[i]);   // after the submission being recorded
     if (n) {
         plat_add64(&m_evicted_n, n);
         plat_add64(&m_evicted_bytes, (int64_t)freed);
@@ -3943,7 +4035,8 @@ typedef struct {
     VkDeviceSize chunk_used;  // bytes of the last chunk handed out
 } Batch;
 
-enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_HOST };
+// DEAD_BUFFER_ADDR: a pool buffer (pool_usage), destroyed through bury.
+enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_HOST, DEAD_BUFFER_ADDR };
 typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl; } Dead;
 
 static PlatRMutex cmd_lock;
@@ -4054,6 +4147,7 @@ static void destroy_dead(VkCtx *c, const Dead *d) {
     case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
     case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
     case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
+    case DEAD_BUFFER_ADDR: bury(c, GRAVE_BUF_VMA, d->handle, d->alloc); break;
     }
 }
 
@@ -4063,6 +4157,7 @@ static void collect_locked_out(VkCtx *c, Dead **out, int *nout, int *cout) {
     retire(c, 0);
     uint64_t tl = 0;
     if (c->timeline) vkGetSemaphoreCounterValue(c->device, c->timeline, &tl);
+    tl = vk_sync_free_done(tl);   // VkCtx.late_completion: the command buffers are done with them too
     int k = 0;
     for (int i = 0; i < ndead; i++) {
         Dead *d = &dead[i];
@@ -4071,7 +4166,7 @@ static void collect_locked_out(VkCtx *c, Dead **out, int *nout, int *cout) {
             free((void *)(uintptr_t)d->handle);
             continue;
         }
-        rec_check_handle(d->kind == DEAD_VIEW ? REC_VIEW : d->kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, d->handle, 1,
+        rec_check_handle(d->kind == DEAD_VIEW ? REC_VIEW : d->kind == DEAD_BUFFER_VMA || d->kind == DEAD_BUFFER_ADDR ? REC_BUFFER : REC_IMAGE, d->handle, 1,
                          d->tl, tl);
         if (!out) { destroy_dead(c, d); continue; }
         if (*nout == *cout) grow((void **)out, cout, sizeof **out);
@@ -4286,7 +4381,7 @@ static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     if (rf > tl) tl = rf;
     dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl};
     if (kind != DEAD_HOST)
-        rec_check_handle(kind == DEAD_VIEW ? REC_VIEW : kind == DEAD_BUFFER_VMA ? REC_BUFFER : REC_IMAGE, handle, 0, tl,
+        rec_check_handle(kind == DEAD_VIEW ? REC_VIEW : kind == DEAD_BUFFER_VMA || kind == DEAD_BUFFER_ADDR ? REC_BUFFER : REC_IMAGE, handle, 0, tl,
                          vk_sync_fence_done());
     plat_rmutex_unlock(&cmd_lock);
 }
@@ -4306,6 +4401,9 @@ void vk_defer_view(VkImageView view) { if (view) defer(DEAD_VIEW, (uint64_t)(uin
 void vk_defer_free(void *p) { if (p) defer(DEAD_HOST, (uint64_t)(uintptr_t)p, NULL); }
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc) {
     if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc);
+}
+static void defer_pool_buffer(VkBuffer buf, VmaAllocation alloc) {   // a pool buffer: bury once the GPU is past it
+    if (buf) defer(DEAD_BUFFER_ADDR, (uint64_t)(uintptr_t)buf, alloc);
 }
 
 void vk_mem_note_submit(uint64_t timeline_value) {
@@ -4349,6 +4447,8 @@ void vk_mem_shutdown(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     vk_sync_shutdown();   // idle and drain callbacks before freeing the GPA table or any callback-owned pool
+    graves_flush(c);      // the queue is idle: what waits goes, and later objects are destroyed at once (bury)
+    graves_closed = 1;
     vk_gpa_report();
     vk_gpa_shutdown();
     vk_texture_shutdown();
