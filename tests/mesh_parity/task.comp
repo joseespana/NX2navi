@@ -1,0 +1,21 @@
+#version 450
+// tests/mesh_parity.c: a task program as the translator sees one, a compute program that fills its payload in shared
+// memory (tools/xlate/AmpereLowering.cs MeshInfo): the mesh workgroup count at word 1, the program's data from word 4.
+// Task workgroup w launches hdr[2] mesh workgroups, tells them their first workgroup (w hdr[2], word 4) and its own
+// number (word 5), and fills words 8 to 71 with a pattern from every thread, which the mesh program checks. It counts
+// itself in the upper half of the counter buffer (from hdr[3]).
+layout(local_size_x = THREADS) in;
+layout(std430, set = 0, binding = 0) readonly buffer Geo { uint hdr[16]; vec4 data[]; } geo;
+layout(std430, set = 0, binding = 1) buffer Cnt { uint n[]; } cnt;
+shared uint sm[SHARED_WORDS];
+
+void main() {
+    uint t = gl_LocalInvocationID.x, w = gl_WorkGroupID.x;
+    for (uint i = t; i < 64u; i += THREADS) sm[8u + i] = w * 131u + i * 7u + 1u;
+    if (t == 0u) {
+        sm[1] = geo.hdr[2];
+        sm[4] = w * geo.hdr[2];
+        sm[5] = w;
+        atomicAdd(cnt.n[geo.hdr[3] + w], 1u);
+    }
+}

@@ -1,0 +1,76 @@
+#version 450
+// tests/mesh_parity.c: a mesh program as the translator sees one, a compute program that fills the stage buffer in
+// shared memory (tools/xlate/AmpereLowering.cs MeshInfo): vertex outputs in 32-vertex groups with a 32-word line per
+// output component, the primitive count at MAP, the primitives' vertex indices as bytes from MAP + 4, the task payload
+// at PAY. tools/xlate/MeshSpirv.cs makes the MeshEXT module from it. tests/mesh_parity.py defines THREADS, MAXV, MAXP,
+// IPP, NLINES, ATTR, MAP, PAY, SHARED_WORDS and LINE_VALUES (one "L(line, value)" per output line of vertex record b).
+//
+// Workgroup w draws primitives [w PPG, w PPG + PPG) of the geometry buffer's hdr[0] (PPG: MAXP), primitive p from
+// vertex records p IPP .. p IPP + IPP - 1, and counts itself in the counter buffer. With -DGRID the workgroup's
+// vertices are the 64 records of an 8 x 8 grid, shared by its 98 triangles (PPG 98), as the game's meshes share theirs. After a task stage (-DHASTASK) its
+// workgroup is the task's first (payload word 4) plus its own ID, and it draws only if the payload arrived whole.
+#define STRIDE 10
+#ifdef GRID
+#define PPG 98u
+#else
+#define PPG uint(MAXP)
+#endif
+layout(local_size_x = THREADS) in;
+layout(std430, set = 0, binding = 0) readonly buffer Geo { uint hdr[16]; vec4 data[]; } geo;
+layout(std430, set = 0, binding = 1) buffer Cnt { uint n[]; } cnt;
+shared uint sm[SHARED_WORDS];
+
+void main() {
+    uint t = gl_LocalInvocationID.x, w = gl_WorkGroupID.x;
+    bool whole = true;
+#ifdef HASTASK
+    uint task = sm[PAY / 4 + 5];
+    for (uint i = 0u; i < 64u; i++) whole = whole && sm[PAY / 4 + 8 + i] == task * 131u + i * 7u + 1u;
+    w += sm[PAY / 4 + 4];
+#endif
+    uint total = geo.hdr[0], first = w * PPG;
+    uint np = whole && total > first ? min(total - first, PPG) : 0u;
+    for (uint v = t; v < uint(MAXV); v += THREADS) {
+#ifdef GRID
+        if (np == 0u || v >= 64u) continue;
+        uint b = (w * 64u + v) * STRIDE;
+#else
+        if (v >= np * IPP) continue;
+        uint b = (first * IPP + v) * STRIDE;
+#endif
+        uint at = ATTR / 4 + (v >> 5) * (NLINES * 32) + (v & 31u);
+#define L(line, value) sm[at + (line) * 32] = floatBitsToUint(value);
+        LINE_VALUES
+#undef L
+#ifdef CLIPWORDS
+        // the clip distance output tests/mesh_parity.py adds
+        sm[CLIPWORDS + v] = floatBitsToUint(geo.data[b + 9].y);
+#endif
+    }
+    if (t == 0u) {
+        sm[MAP / 4] = np;
+        // byte 4 + IPP p + j of the primitive area: vertex p IPP + j
+        for (uint k = 1u; k * 4u < 4u + uint(IPP * MAXP) + 3u; k++) {
+            uint word = 0u;
+            for (uint j = 0u; j < 4u; j++) {
+                uint n = k * 4u + j - 4u;   // corner n % IPP of primitive n / IPP
+#ifdef GRID
+                uint p = n / 3u, c = n % 3u, cell = (p % 98u) / 2u;
+                uint corner = (p & 1u) == 0u ? (c == 0u ? 0u : c == 1u ? 1u : 8u) : (c == 0u ? 1u : c == 1u ? 9u : 8u);
+                n = cell / 7u * 8u + cell % 7u + corner;
+#endif
+                word |= (n & 0xffu) << (8u * j);
+            }
+            sm[MAP / 4 + k] = word;
+        }
+#ifdef PRIMWORDS
+        // per-primitive values for the outputs tests/mesh_parity.py adds: the primitive's number in the draw and its colour
+        for (uint p = 0u; p < np; p++) {
+            vec4 c = geo.data[((first + p) * IPP + IPP - 1u) * STRIDE + 4u];
+            sm[PRIMWORDS + p * 8u] = first + p;
+            for (int j = 0; j < 4; j++) sm[PRIMWORDS + p * 8u + 4u + j] = floatBitsToUint(c[j]);
+        }
+#endif
+        atomicAdd(cnt.n[w], 1u);
+    }
+}

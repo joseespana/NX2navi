@@ -121,6 +121,16 @@ PATCHES = [
      '\tmtlFeatures |= _isUsingMetalArgumentBuffers << 0;\n',
      '\tmtlFeatures |= _isUsingMetalArgumentBuffers << 0;\n'
      f'\tmtlFeatures |= {MSL_VERSION}u << 9;\t// the MSL the patched SPIRV-Cross writes\n'),
+    # The cull mode and the fill mode of a mesh pipeline. Metal culls and fills triangles only, so MoltenVK sets both
+    # on the encoder only for a pipeline whose primitive type is a triangle one, and a mesh pipeline, which has no
+    # input assembly state, was given the point type: a mesh draw kept the cull mode and fill mode of the last
+    # triangle draw of its render pass before it (none and fill at the start of a pass), whatever its own state asked
+    # for. A mesh pipeline now counts as drawing triangles there; Metal ignores both for the lines or points a mesh
+    # shader may emit instead.
+    (PIPELINE,
+     '\t_vkPrimitiveTopology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;\n',
+     '\t// a mesh pipeline: triangles, so that its cull mode and fill mode reach the encoder\n'
+     '\t_vkPrimitiveTopology = _isMeshPipeline ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : VK_PRIMITIVE_TOPOLOGY_POINT_LIST;\n'),
     # fetchDependencies checks out each dependency at its revision with --force, which would drop SPIRV_CROSS_PATCHES:
     # a repository already at its revision is left as it is (build() resets SPIRV-Cross itself before patching it).
     ('fetchDependencies',

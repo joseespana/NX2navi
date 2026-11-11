@@ -367,6 +367,7 @@ change passes these, all run with `.venv`:
 | `tests\flags_check.py` | the function-local flag helpers of `runtime\cpu.h` against its packed ones | no |
 | `tests\ds3_check.py` | the DualShock 3 report decoding and output report of `runtime\input_ds3.c` | no |
 | `tests\gpa_check.py` | the device address table of `runtime\vk_gpa.c` as a shader reads it: mapping, mirrors and twins, overlapping imports, and blocks given back and taken again while pool addresses climb (no GPU; any Python) | no |
+| `tests/mesh_parity.py` | macOS only (skipped elsewhere): the same geometry drawn by a vertex shader pipeline and by a mesh shader pipeline through the game's own MoltenVK (`tools/build_moltenvk.py --install`), compared pixel by pixel in colour and depth: position and both clip spaces, viewports, culling and facing, interpolation and the flat source, depth tests, bias and clamp, lines and points, workgroup counts across the 1024 blocks, task payloads, the game's largest output sizes. The mesh modules are made by `tools/xlate/MeshSpirv.cs` itself. Needs a GPU, the .NET SDK, glslang and SPIRV-Tools; a few seconds | no |
 | `tests\excl_mt.py` | the exclusive monitor helpers under contention and ABA, on several threads | no |
 | `tests\jumptables_check.py` | `recomp/jumptables.py` against a Unicorn oracle; must report 0 disagreements, on 1.4.3 too | yes |
 
