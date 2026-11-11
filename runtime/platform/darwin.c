@@ -15,6 +15,8 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/mach_vm.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <os/os_sync_wait_on_address.h>
 #include <poll.h>
 #include <pthread.h>
@@ -797,56 +799,6 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) { retur
 
 int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
-struct PlatFileSwap {
-    int fd;
-    void *view;
-    size_t n;
-    char tmp[PATH_MAX + 48], path[PATH_MAX];
-};
-
-// The n bytes are allocated on the disk first (F_PREALLOCATE, macOS's posix_fallocate): a full disk fails here and not
-// at a page of the mapping, where it would be a bus error.
-void *plat_file_swap_begin(const char *path, size_t n, PlatFileSwap **swap) {
-    if (!n || (access(path, W_OK) && errno != ENOENT)) return NULL;   // a read-only file stays, as in write_swap
-    PlatFileSwap *s = calloc(1, sizeof *s);
-    int len = s ? snprintf(s->tmp, sizeof s->tmp, "%s.%u.%u.tmp", path, plat_process_id(), plat_thread_id()) : -1;
-    if (len < 0 || len >= (int)sizeof s->tmp || strlen(path) >= sizeof s->path) {
-        free(s);
-        return NULL;
-    }
-    strcpy(s->path, path);
-    s->n = n;
-    s->fd = open(s->tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (s->fd < 0) {
-        free(s);
-        return NULL;
-    }
-    fstore_t fs = {.fst_flags = F_ALLOCATEALL, .fst_posmode = F_PEOFPOSMODE, .fst_offset = 0, .fst_length = (off_t)n};
-    void *v = fcntl(s->fd, F_PREALLOCATE, &fs) == -1 || ftruncate(s->fd, (off_t)n)
-                  ? MAP_FAILED : mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
-    if (v == MAP_FAILED) {
-        close(s->fd);
-        unlink(s->tmp);
-        free(s);
-        return NULL;
-    }
-    s->view = v;
-    *swap = s;
-    return v;
-}
-
-int plat_file_swap_end(PlatFileSwap *s, size_t used, int ok) {
-    ok = ok && used && used <= s->n && msync(s->view, used, MS_SYNC) == 0;
-    munmap(s->view, s->n);
-    ok = ok && (used == s->n || ftruncate(s->fd, (off_t)used) == 0) && fsync(s->fd) == 0;
-    ok = close(s->fd) == 0 && ok;
-    ok = ok && rename(s->tmp, s->path) == 0;
-    if (ok) sync_dir_of(s->path);
-    else unlink(s->tmp);
-    free(s);
-    return ok;
-}
-
 int plat_file_flush(const char *path) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return 0;
@@ -872,6 +824,12 @@ int plat_file_set_readonly(const char *path, int on) {
     if (stat(path, &st)) return 0;
     mode_t m = on ? st.st_mode & ~(mode_t)0222 : st.st_mode | S_IWUSR;
     return chmod(path, m & 07777) == 0;
+}
+
+int plat_file_private(const char *path) {
+    struct stat st;
+    if (stat(path, &st)) return 0;
+    return chmod(path, S_ISDIR(st.st_mode) ? 0700 : 0600) == 0;
 }
 
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx) {
@@ -1873,6 +1831,40 @@ int plat_clipboard_set(const char *utf8) {
     return ok && WIFEXITED(status) && !WEXITSTATUS(status);
 }
 
+// pbpaste writes the clipboard's text. Any thread: no window system call is made here.
+int plat_clipboard_get(char *out, size_t cap) {
+    if (!cap) return 0;
+    out[0] = 0;
+    int p[2];
+    if (pipe_cloexec(p)) return 0;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+    char *argv[] = {"pbpaste", NULL};
+    pid_t pid;
+    int e = posix_spawn(&pid, "/usr/bin/pbpaste", &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(p[1]);
+    size_t n = 0;
+    int more = 0;   // the text is longer than out holds
+    while (!e) {
+        char rest[256];
+        ssize_t k = n < cap - 1 ? read(p[0], out + n, cap - 1 - n) : read(p[0], rest, sizeof rest);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        if (n < cap - 1) n += (size_t)k;
+        else more = 1;
+    }
+    close(p[0]);
+    int status = 0;
+    if (!e) waitpid(pid, &status, 0);
+    if (e || !WIFEXITED(status) || WEXITSTATUS(status)) n = 0;
+    if (more)   // cut where a character starts, not inside one
+        while (n && ((unsigned char)out[n] & 0xc0) == 0x80) n--;
+    out[n] = 0;
+    return n != 0;
+}
+
 static void reap_main(void *arg) {
     waitpid((pid_t)(intptr_t)arg, NULL, 0);
 }
@@ -1977,6 +1969,7 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
 int plat_commit_enforced(void) { return 0; }
 int plat_commit_note(char *out, size_t cap) { if (cap) out[0] = 0; return 0; }
 int plat_commit_counts_vram(void) { return 0; }
+int plat_page_file_managed(void) { return -1; }   // no page file Windows sizes
 
 // ---- child processes
 
@@ -2104,6 +2097,159 @@ void plat_ipc_close(PlatIpc *p) {
     if (!p) return;
     close(p->fd);
     free(p);
+}
+
+// ---- UDP sockets (platform.h): the co-op layer's transport
+struct PlatUdp { int fd, v6; };
+
+static void addr_from_sockaddr(PlatAddr *out, const struct sockaddr_storage *ss) {
+    uint8_t ip[16] = {0};
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)ss;
+        memcpy(ip, &a->sin6_addr, 16);
+        plat_addr_set(out, ip, ntohs(a->sin6_port), a->sin6_scope_id);
+    } else {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)ss;
+        ip[10] = ip[11] = 0xff;
+        memcpy(ip + 12, &a->sin_addr, 4);
+        plat_addr_set(out, ip, ntohs(a->sin_port), 0);
+    }
+}
+
+// The socket address of a for a socket of family v6 (1: AF_INET6, 0: AF_INET); 0 when an IPv4 socket cannot reach it.
+static int addr_to_sockaddr(const PlatAddr *a, int v6, struct sockaddr_storage *ss, socklen_t *len) {
+    uint8_t ip[16];
+    uint32_t scope;
+    plat_addr_get(a, ip, &scope);
+    memset(ss, 0, sizeof *ss);
+    if (v6) {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)ss;
+        s->sin6_len = sizeof *s;
+        s->sin6_family = AF_INET6;
+        s->sin6_port = htons(plat_addr_port(a));
+        s->sin6_scope_id = scope;
+        memcpy(&s->sin6_addr, ip, 16);
+        *len = sizeof *s;
+        return 1;
+    }
+    static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (memcmp(ip, mapped, sizeof mapped)) return 0;
+    struct sockaddr_in *s = (struct sockaddr_in *)ss;
+    s->sin_len = sizeof *s;
+    s->sin_family = AF_INET;
+    s->sin_port = htons(plat_addr_port(a));
+    memcpy(&s->sin_addr, ip + 12, 4);
+    *len = sizeof *s;
+    return 1;
+}
+
+int plat_net_resolve(const char *host, uint16_t port, PlatAddr *out) {
+    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM}, *res = NULL, *pick = NULL;
+    if (!host || !*host || getaddrinfo(host, NULL, &hints, &res) != 0) return 0;
+    for (struct addrinfo *r = res; r; r = r->ai_next) {
+        if (r->ai_addrlen > sizeof(struct sockaddr_storage) || (r->ai_family != AF_INET && r->ai_family != AF_INET6)) continue;
+        if (!pick || (r->ai_family == AF_INET && pick->ai_family != AF_INET)) pick = r;   // IPv4 first
+    }
+    int ok = pick != NULL;
+    if (ok) {
+        struct sockaddr_storage ss;
+        memset(&ss, 0, sizeof ss);
+        memcpy(&ss, pick->ai_addr, pick->ai_addrlen);
+        addr_from_sockaddr(out, &ss);
+        uint8_t ip[16];
+        uint32_t scope;
+        plat_addr_get(out, ip, &scope);
+        plat_addr_set(out, ip, port, scope);
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
+// A datagram socket of the family, non-blocking and closed on exec. The system has no MSG_NOSIGNAL: SO_NOSIGPIPE
+// keeps a send from raising SIGPIPE.
+static int udp_socket(int family) {
+    int fd = socket(family, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) || fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+PlatUdp *plat_udp_open(uint16_t port, int dual_stack) {
+    int v6 = dual_stack;
+    int fd = v6 ? udp_socket(AF_INET6) : -1;
+    if (fd >= 0) {
+        int off = 0;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
+        struct sockaddr_in6 a = {.sin6_len = sizeof a, .sin6_family = AF_INET6, .sin6_addr = in6addr_any,
+                                 .sin6_port = htons(port)};
+        if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) close(fd), fd = -1;
+    }
+    if (fd < 0) {   // IPv4 only, asked for or all the machine has
+        v6 = 0;
+        fd = udp_socket(AF_INET);
+        if (fd < 0) return NULL;
+        struct sockaddr_in a = {.sin_len = sizeof a, .sin_family = AF_INET, .sin_port = htons(port)};
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+            close(fd);
+            return NULL;
+        }
+    }
+    PlatUdp *u = malloc(sizeof *u);
+    if (!u) {
+        close(fd);
+        return NULL;
+    }
+    u->fd = fd, u->v6 = v6;
+    return u;
+}
+
+uint16_t plat_udp_port(const PlatUdp *u) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    if (!u || getsockname(u->fd, (struct sockaddr *)&ss, &len) != 0) return 0;
+    PlatAddr a;
+    addr_from_sockaddr(&a, &ss);
+    return plat_addr_port(&a);
+}
+
+int plat_udp_send(PlatUdp *u, const PlatAddr *to, const void *p, size_t n) {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    if (!u || !addr_to_sockaddr(to, u->v6, &ss, &len)) return 0;
+    for (;;) {
+        ssize_t k = sendto(u->fd, p, n, 0, (struct sockaddr *)&ss, len);
+        if (k >= 0) return 1;
+        if (errno == EINTR) continue;
+        // a full buffer, a missing route or an ICMP error is a lost datagram; a datagram too long or a socket that is not
+        // ours to use can never be sent
+        return errno != EMSGSIZE && errno != EBADF && errno != EINVAL && errno != EAFNOSUPPORT && errno != ENOTSOCK;
+    }
+}
+
+int plat_udp_recv(PlatUdp *u, void *buf, size_t cap, PlatAddr *from, uint32_t ms) {
+    if (!u) return -1;
+    struct pollfd pf = {.fd = u->fd, .events = POLLIN};
+    int r = poll(&pf, 1, ms > (uint32_t)INT32_MAX ? INT32_MAX : (int)ms);
+    if (r < 0) return errno == EINTR ? 0 : -1;
+    if (r == 0) return 0;
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+    ssize_t k = recvfrom(u->fd, buf, cap, MSG_DONTWAIT, (struct sockaddr *)&ss, &len);
+    if (k < 0) return errno == EAGAIN || errno == EINTR || errno == ECONNREFUSED || errno == EHOSTUNREACH ? 0 : -1;
+    if (from) addr_from_sockaddr(from, &ss);
+    return (int)k;
+}
+
+void plat_udp_close(PlatUdp *u) {
+    if (!u) return;
+    close(u->fd);
+    free(u);
 }
 
 // ---- restart

@@ -46,7 +46,7 @@ def main():
     rt = ROOT / 'runtime'
     mac = sys.platform == 'darwin'
     plat = [rt / 'platform' / ('win32.c' if win else 'darwin.c' if mac else 'linux.c'), rt / 'platform' / 'common.c']
-    libs = ['-lbcrypt', '-lpsapi', '-lwinmm', '-ldbghelp', '-lshell32', '-lole32', '-luser32', '-ladvapi32'] if win \
+    libs = ['-lbcrypt', '-lws2_32', '-lpsapi', '-lwinmm', '-ldbghelp', '-lshell32', '-lole32', '-luser32', '-ladvapi32'] if win \
         else ['-framework', 'CoreFoundation'] if mac else ['-lpthread']
     subprocess.check_call([compiler(), '-O1', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing',
                            *march(), '-I', str(rt), '-I', str(work),
