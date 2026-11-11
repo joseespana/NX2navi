@@ -5014,12 +5014,18 @@ static void op_draw(VkExec *ex, const p_draw *d) {
 // (op_draw_idx). Without restart the 0xffff entries of NX2NAVI's terrain and cliff strips fetch vertex 65535 + base and
 // the triangles around them drop out.
 static int restart_for(const VkExec *ex, int prim, int itype) {
-    if (!ex->prim_restart.enable) return 0;
+    // A portability driver over Metal: Metal itself always restarts strips at the all-ones index, and our MoltenVK
+    // build can turn that off (its private Metal calls). With it off, a strip the game draws without restart fetches
+    // vertex 65535 + base where it holds 0xffff, past the vertex buffer, which other drivers tolerate and Metal may
+    // answer with a GPU fault. Strips keep restarting there, as they did before that build.
+    int forced = !ex->prim_restart.enable && vk_ctx()->image_bytes_apart;
+    if (!ex->prim_restart.enable && !forced) return 0;
     switch (vk_pipeline_topology(prim)) {
     case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
     case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: break;
     default: return 0;   // lists: a restart index only drops the unfinished primitive
     }
+    if (forced) return 1;
     static const uint32_t all_ones[3] = {0xffu, 0xffffu, 0xffffffffu};
     if (ex->prim_restart.index == all_ones[itype]) return 1;
     warn_once(W_RESTART, "primitive restart index %#x with %d-byte indices is not replayed: strips drawn without restart",

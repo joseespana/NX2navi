@@ -10,10 +10,14 @@ thread's vertices are added to the converted module's assembly here.
 Needs: the game's MoltenVK (tools/build_moltenvk.py --install), the Vulkan headers and loader, glslangValidator,
 spirv-as, spirv-dis and spirv-val (Homebrew: vulkan-headers vulkan-loader glslang spirv-tools), the .NET SDK.
 
-Usage: mesh_parity.py [--moltenvk DIR] [--provoking first|last] [--filter TEXT] [--mvk-debug] [--keep-going]
+A flat input is expected from its primitive's last vertex, as the game expects it. With a driver that has
+provokingVertexLast (VK_EXT_provoking_vertex) both pipelines ask for it, as runtime/vk_pipeline.c does. Without it, or
+with --rotate, the mesh modules are converted with the translator's "flat_first" option (each triangle handed over last
+vertex first) and the vertex pipeline's shader stands in for the last vertex; lines then keep the first.
+
+Usage: mesh_parity.py [--moltenvk DIR] [--rotate] [--filter TEXT] [--mvk-debug]
   --moltenvk   the folder with MoltenVK_icd.json (default ~/Games/NX2navi/Ocarina/moltenvk)
-  --provoking  the vertex of a triangle a flat input is expected from in a mesh pipeline (default last: what the game
-               expects and tools/xlate/MeshSpirv.cs arranges on macOS)
+  --rotate     test the path of a driver without provokingVertexLast even if this one has it
   --filter     run only the cases whose name contains TEXT
 """
 import argparse
@@ -280,20 +284,21 @@ def build_shaders(spv):
             d.append('HASTASK')
         if extra == 'clip':
             d.append(f'CLIPWORDS {words}u')
-            extras.append((add_clip, spv / f'{name}.mesh.spv', maxv, words))
+            extras += [(add_clip, spv / f'{name}.{k}.spv', maxv, words) for k in ('mesh', 'rmesh')]
             words += maxv
         elif extra in ('prim', 'layer'):
             d.append(f'PRIMWORDS {words}u')
-            extras.append((add_prim, spv / f'{name}.mesh.spv', maxp, words, extra == 'layer'))
+            extras += [(add_prim, spv / f'{name}.{k}.spv', maxp, words, extra == 'layer') for k in ('mesh', 'rmesh')]
             words += 8 * maxp
         elif extra == 'cross':
-            extras.append((add_cross, spv / f'{name}.mesh.spv'))
+            extras += [(add_cross, spv / f'{name}.{k}.spv') for k in ('mesh', 'rmesh')]
         d.append(f'SHARED_WORDS {words}')
         d += [x for x in defs if x == 'GRID']
         glsl('mesh.comp', 'comp', spv / f'{name}.mesh.comp.spv', d, line_values(lines))
-        jobs.append(dict(lay, **{'in': str(spv / f'{name}.mesh.comp.spv'), 'out': str(spv / f'{name}.mesh.spv'), 'stage': 7,
-                                 'threads': threads, 'maxv': maxv, 'maxp': maxp, 'topo': topo, 'payload': payload,
-                                 'task': bool(payload), 'lines': lines}))
+        for kind, flat_first in (('mesh', False), ('rmesh', True)):   # rmesh: for a driver without provokingVertexLast
+            jobs.append(dict(lay, **{'in': str(spv / f'{name}.mesh.comp.spv'), 'out': str(spv / f'{name}.{kind}.spv'),
+                                     'stage': 7, 'threads': threads, 'maxv': maxv, 'maxp': maxp, 'topo': topo,
+                                     'payload': payload, 'task': bool(payload), 'lines': lines, 'flat_first': flat_first}))
         if payload:
             glsl('task.comp', 'comp', spv / f'{name}.task.comp.spv', [f'THREADS {threads}', f'SHARED_WORDS {payload // 4}'])
             jobs.append({'in': str(spv / f'{name}.task.comp.spv'), 'out': str(spv / f'{name}.task.spv'), 'stage': 6,
@@ -318,7 +323,7 @@ def build_shaders(spv):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--moltenvk', type=Path, default=Path.home() / 'Games' / 'NX2navi' / 'Ocarina' / 'moltenvk')
-    ap.add_argument('--provoking', choices=('first', 'last'), default='last')
+    ap.add_argument('--rotate', action='store_true')
     ap.add_argument('--filter', default='')
     ap.add_argument('--mvk-debug', action='store_true', help="MoltenVK's own log, with every shader's MSL")
     a = ap.parse_args()
@@ -344,7 +349,7 @@ def main():
         env.update(MVK_CONFIG_DEBUG='1', MVK_CONFIG_LOG_LEVEL='3')
     else:
         env.setdefault('MVK_CONFIG_LOG_LEVEL', '1')
-    return subprocess.run([str(exe), str(spv), a.provoking, a.filter], env=env).returncode
+    return subprocess.run([str(exe), str(spv), 'rotate' if a.rotate else 'auto', a.filter], env=env).returncode
 
 
 if __name__ == '__main__':

@@ -1,7 +1,8 @@
 // tests/mesh_parity.py: turns compute modules into task and mesh modules with the translator's own MeshSpirv.Convert,
 // so the test draws with the module shape the game's shaders have. One argument: a JSON list of jobs
 //   {"in": compute.spv, "out": mesh.spv, "stage": 6 | 7, "threads", "maxv", "maxp", "topo", "payload", "task": bool,
-//    "lines": [output line addresses], "attr", "map", "pay", "shared": the layout the GLSL was compiled for}
+//    "lines": [output line addresses], "attr", "map", "pay", "shared": the layout the GLSL was compiled for,
+//    "flat_first": bool (the translator's job option of that name: triangles handed over last vertex first)}
 // The layout comes from AmpereLowering.MeshInfo.Layout on a program header built from the lines; a job whose own
 // numbers differ from it fails.
 using System;
@@ -19,6 +20,7 @@ static class Program
             {
                 Stage = (int)j["stage"], Threads = (int)j["threads"], MaxVertices = (int)j["maxv"], MaxPrimitives = (int)j["maxp"],
                 Topology = (int)j["topo"], PayloadBytes = (int)j["payload"], HasTask = (bool)j["task"],
+                FlatFirst = j["flat_first"] is JsonNode f && (bool)f,
             };
             int[] lines = j["lines"].AsArray().Select(x => (int)x).ToArray();
             var sph = new byte[0x50];

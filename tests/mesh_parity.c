@@ -3,12 +3,14 @@
 // depth buffer. The mesh and task modules have the shape tools/xlate/MeshSpirv.cs gives the game's (tests/mesh_parity.py
 // builds them with that file). Built and run by tests/mesh_parity.py against the game's own MoltenVK; macOS only.
 //
-//   mesh_parity <spv dir> <first|last> [filter]
+//   mesh_parity <spv dir> <auto|rotate> [filter]
 //
 // One line per case: "pass" or "FAIL" with the number of differing pixels per target and the first of them. A case
-// marked as a known difference prints "known" and does not fail the run. "last": a flat input of a mesh pipeline is
-// expected from its triangle's last vertex (what the game expects, and what tools/xlate/MeshSpirv.cs arranges on
-// macOS; a line's still from its first); "first": from the first (Vulkan's default).
+// marked as a known difference prints "known" and does not fail the run. A flat input is expected from its primitive's
+// last vertex, as the game expects it. "auto": with provokingVertexLast both pipelines ask the driver for it
+// (runtime/vk_pipeline.c P.pv_last). Without the feature, or with "rotate", the mesh modules are the ones converted with
+// the translator's flat_first option (triangles handed over last vertex first, tools/xlate/MeshSpirv.cs), and the vertex
+// pipeline's shader takes a triangle's flat values from its last vertex; a line's then come from its first in both.
 // Exits 1 when a case failed.
 #include <math.h>
 #include <stdint.h>
@@ -24,7 +26,7 @@ enum { W = 64, H = 64, LAYERS = 2, NCOL = 4, STRIDE = 10, MAXVERT = 16384, NCNT 
 #define OK(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) { printf("FAIL: %s = %d (line %d)\n", #call, (int)r_, __LINE__); exit(2); } } while (0)
 
 // The shader sets tests/mesh_parity.py builds (its VARIANTS): vertices per primitive, primitives per mesh workgroup.
-typedef struct { const char *name; int ipp, maxp, task, viewports; VkShaderModule vs, fs, mfs, ms, ts; } Variant;
+typedef struct { const char *name; int ipp, maxp, task, viewports; VkShaderModule vs, fs, mfs, ms, rms, ts; } Variant;
 static Variant variants[] = {
     {"tri", 3, 32}, {"line", 2, 32}, {"point", 1, 32}, {"point_nosize", 1, 32}, {"count", 1, 1}, {"tcount", 1, 1, 1},
     {"ttri", 3, 32, 1}, {"big", 3, 53}, {"tbig", 3, 53, 1}, {"bigx", 3, 53}, {"clip", 3, 32}, {"prim", 3, 32},
@@ -51,6 +53,7 @@ typedef struct {
     int no_image;       // more primitives than pixels: only the workgroup counters are checked
     int known;          // a difference that is expected and reported, not a failure
     int may_be_empty;   // nothing drawn by either pipeline is a pass
+    int plain;          // pipelines as the driver draws them by itself: no provoking vertex state, no rotated module
 } State;
 
 static VkInstance inst;
@@ -69,7 +72,8 @@ static VkBuffer geo_buf, cnt_buf, read_buf, ind_buf;
 static uint32_t *geo_hdr, *cnt, *ind;
 static float *geo;      // vertex records: STRIDE vectors each
 static uint8_t *readback;
-static int provoking_last, fails, cases;
+static int pv_ext;      // both pipelines ask the driver for the last vertex (VK_EXT_provoking_vertex)
+static int fails, cases;
 static const char *filter = "";
 static PFN_vkCmdDrawMeshTasksEXT draw_mesh;                   // extension commands: not exported by the loader
 static PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_indirect;
@@ -145,7 +149,16 @@ static void init(const char *dir) {
     vkGetPhysicalDeviceProperties(phys, &pp);
 
     // every feature the driver has, but the two mesh features that need features of other extensions
-    VkPhysicalDeviceDepthClipControlFeaturesEXT dcc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    uint32_t next = 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &next, NULL);
+    VkExtensionProperties *exts = calloc(next ? next : 1, sizeof *exts);
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &next, exts);
+    int has_pv = 0;
+    for (uint32_t i = 0; i < next; i++) has_pv |= !strcmp(exts[i].extensionName, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    free(exts);
+    VkPhysicalDeviceProvokingVertexFeaturesEXT pvf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
+    VkPhysicalDeviceDepthClipControlFeaturesEXT dcc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT,
+                                                       .pNext = has_pv ? &pvf : NULL};
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, .pNext = &dcc};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &mesh};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
@@ -157,6 +170,8 @@ static void init(const char *dir) {
            "output layer/viewport %d/%d; largePoints %d\n", pp.deviceName, mesh.meshShader, mesh.taskShader,
            dcc.depthClipControl, f2.features.depthClamp, f2.features.shaderClipDistance, f2.features.shaderCullDistance,
            f2.features.multiViewport, f12.shaderOutputLayer, f12.shaderOutputViewportIndex, f2.features.largePoints);
+    printf("provokingVertexLast %d; logicOp %d; wideLines %d\n", (int)pvf.provokingVertexLast, f2.features.logicOp, f2.features.wideLines);
+    pv_ext = pv_ext && pvf.provokingVertexLast;
     printf("limits: mesh shared memory %u, output memory %u, payload and output %u, vertices %u, primitives %u, "
            "mesh workgroups %u, task workgroups %u, task payload %u\n", mprop.maxMeshSharedMemorySize,
            mprop.maxMeshOutputMemorySize, mprop.maxMeshPayloadAndOutputMemorySize, mprop.maxMeshOutputVertices,
@@ -173,9 +188,10 @@ static void init(const char *dir) {
     for (uint32_t i = 0; i < nq; i++) if (qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { qf = i; break; }
     float prio = 1;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = qf, .queueCount = 1, .pQueuePriorities = &prio};
-    const char *dext[] = {VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, "VK_KHR_portability_subset"};
+    const char *dext[] = {VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, "VK_KHR_portability_subset",
+                          VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &qi, .enabledExtensionCount = 3, .ppEnabledExtensionNames = dext};
+        .pQueueCreateInfos = &qi, .enabledExtensionCount = has_pv ? 4 : 3, .ppEnabledExtensionNames = dext};
     OK(vkCreateDevice(phys, &di, NULL, &dev));
     vkGetDeviceQueue(dev, qf, 0, &queue);
     draw_mesh = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT");
@@ -244,28 +260,28 @@ static void init(const char *dir) {
     for (int i = 0; i < NVARIANT; i++) {
         Variant *v = &variants[i];
         v->vs = module(dir, v->name, "vert"), v->fs = module(dir, v->name, "frag"), v->mfs = module(dir, v->name, "mfrag");
-        v->ms = module(dir, v->name, "mesh");
+        v->ms = module(dir, v->name, "mesh"), v->rms = module(dir, v->name, "rmesh");
         if (v->task) v->ts = module(dir, v->name, "task");
         if (!v->viewports) v->viewports = 1;
     }
 }
 
 // ---- pipelines: one per shader set, stage kind and the state that is not dynamic
-typedef struct { int variant, mesh, minus_w, clamp, wire, nocolour; VkPipeline p; } Pipe;
+typedef struct { int variant, mesh, minus_w, clamp, wire, nocolour, plain; VkPipeline p; } Pipe;
 static Pipe pipes[512];
 static int npipes;
 
 static VkPipeline pipeline(const State *s, int mesh, int nocolour) {
     for (int i = 0; i < npipes; i++)
         if (pipes[i].variant == s->variant && pipes[i].mesh == mesh && pipes[i].minus_w == s->minus_w &&
-            pipes[i].clamp == s->clamp && pipes[i].wire == s->wire && pipes[i].nocolour == nocolour) return pipes[i].p;
+            pipes[i].clamp == s->clamp && pipes[i].wire == s->wire && pipes[i].nocolour == nocolour && pipes[i].plain == s->plain) return pipes[i].p;
     const Variant *v = &variants[s->variant];
     VkPipelineShaderStageCreateInfo st[3];
     uint32_t nst = 0;
 #define STAGE(bit, mod) st[nst++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = bit, .module = mod, .pName = "main"}
     if (mesh) {
         if (v->task) STAGE(VK_SHADER_STAGE_TASK_BIT_EXT, v->ts);
-        STAGE(VK_SHADER_STAGE_MESH_BIT_EXT, v->ms);
+        STAGE(VK_SHADER_STAGE_MESH_BIT_EXT, pv_ext || s->plain ? v->ms : v->rms);
         STAGE(VK_SHADER_STAGE_FRAGMENT_BIT, v->mfs);
     } else {
         STAGE(VK_SHADER_STAGE_VERTEX_BIT, v->vs);
@@ -278,8 +294,11 @@ static VkPipeline pipeline(const State *s, int mesh, int nocolour) {
         .negativeOneToOne = s->minus_w};
     VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &cc,
         .viewportCount = (uint32_t)v->viewports, .scissorCount = (uint32_t)v->viewports};
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+        .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT};
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .depthClampEnable = s->clamp, .polygonMode = s->wire ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, .lineWidth = 1.0f};
+        .pNext = pv_ext && !s->plain ? &pvs : NULL, .depthClampEnable = s->clamp, .polygonMode = s->wire ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -299,7 +318,7 @@ static VkPipeline pipeline(const State *s, int mesh, int nocolour) {
     VkPipeline p = VK_NULL_HANDLE;
     VkResult r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, NULL, &p);
     if (r != VK_SUCCESS) p = VK_NULL_HANDLE;
-    pipes[npipes++] = (Pipe){s->variant, mesh, s->minus_w, s->clamp, s->wire, nocolour, p};
+    pipes[npipes++] = (Pipe){s->variant, mesh, s->minus_w, s->clamp, s->wire, nocolour, s->plain, p};
     return p;
 }
 
@@ -325,7 +344,7 @@ static void render(const State *s, const char *kinds, Shot *out) {
     const Variant *v = &variants[s->variant];
     memset(out, 0, sizeof *out);
     memset(cnt, 0, NCNT * 4);
-    geo_hdr[0] = (uint32_t)s->nprims, geo_hdr[1] = (uint32_t)(provoking_last && v->ipp == 3), geo_hdr[2] = (uint32_t)s->per_task, geo_hdr[3] = NCNT / 2;
+    geo_hdr[0] = (uint32_t)s->nprims, geo_hdr[1] = (uint32_t)(!pv_ext && !s->plain && v->ipp == 3), geo_hdr[2] = (uint32_t)s->per_task, geo_hdr[3] = NCNT / 2;
     OK(vkResetCommandBuffer(cb, 0));
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     OK(vkBeginCommandBuffer(cb, &bi));
@@ -503,40 +522,52 @@ static int check(const char *name, const State *s, const char *kinds) {
     return !bad;
 }
 
-// Which vertex of a primitive a flat input comes from: 1, 2 or 3 (0: none of them).
+// Which vertex of a primitive a flat input comes from, 1, 2 or 3 (0: none of them): as the driver draws by itself
+// (info), and as the cases draw, where it must be the last vertex (a line's first when triangles are rotated instead).
 static void provoking_info(void) {
     static Shot shot;
     static const float tri[3][2] = {{-0.9f, -0.9f}, {0.9f, -0.9f}, {0.0f, 0.9f}}, line[2][2] = {{-0.9f, 0.01f}, {0.9f, 0.01f}};
-    int was = provoking_last;
-    provoking_last = 0;
-    for (int kind = 0; kind < 2; kind++) {
-        int ipp = kind ? 2 : 3, at[2];
-        memset(geo, 0, 3 * STRIDE * 16);
-        for (int j = 0; j < ipp; j++) {
-            float *v = vert(j);
-            v[0] = kind ? line[j][0] : tri[j][0], v[1] = kind ? line[j][1] : tri[j][1], v[2] = 0.5f, v[3] = 1;
-            v[8] = (float)(j + 1);   // the flat vector's x
-            v[36] = 1, v[37] = 1, v[38] = 1;
+    for (int plain = 1; plain >= 0; plain--)
+        for (int kind = 0; kind < 2; kind++) {
+            int ipp = kind ? 2 : 3, at[2];
+            memset(geo, 0, 3 * STRIDE * 16);
+            for (int j = 0; j < ipp; j++) {
+                float *v = vert(j);
+                v[0] = kind ? line[j][0] : tri[j][0], v[1] = kind ? line[j][1] : tri[j][1], v[2] = 0.5f, v[3] = 1;
+                v[8] = (float)(j + 1);   // the flat vector's x
+                v[36] = 1, v[37] = 1, v[38] = 1;
+            }
+            State s = base(kind ? V_LINE : V_TRI, 1);
+            s.plain = plain;
+            for (int m = 0; m < 2; m++) {
+                render(&s, m ? "M" : "V", &shot);
+                const float *flat = (const float *)(shot.px + COL_BYTES);
+                at[m] = 0;
+                for (int i = 0; i < W * H; i++) if (flat[i * 4] > 0) at[m] = (int)flat[i * 4];
+            }
+            if (plain) {
+                printf("info: with no provoking vertex state, a %s's flat input comes from vertex %d of %d in a vertex pipeline, "
+                       "vertex %d in a mesh pipeline\n", kind ? "line" : "triangle", at[0], ipp, at[1]);
+                continue;
+            }
+            char name[64];
+            snprintf(name, sizeof name, "c.flat_source.%s", kind ? "line" : "triangle");
+            if (!strstr(name, filter)) continue;
+            int want = kind && !pv_ext ? 1 : ipp, ok = at[0] == want && at[1] == want;
+            cases++, fails += !ok;
+            printf("%-44s %s   vertex %d of %d in the vertex pipeline, vertex %d in the mesh pipeline (expected %d)\n", name,
+                   ok ? "pass" : "FAIL", at[0], ipp, at[1], want);
         }
-        State s = base(kind ? V_LINE : V_TRI, 1);
-        for (int m = 0; m < 2; m++) {
-            render(&s, m ? "M" : "V", &shot);
-            const float *flat = (const float *)(shot.px + COL_BYTES);
-            at[m] = 0;
-            for (int i = 0; i < W * H; i++) if (flat[i * 4] > 0) at[m] = (int)flat[i * 4];
-        }
-        printf("info: a %s's flat input comes from vertex %d of %d in a vertex pipeline, vertex %d in a mesh pipeline\n",
-               kind ? "line" : "triangle", at[0], ipp, at[1]);
-    }
-    provoking_last = was;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { printf("usage: mesh_parity <spv dir> <first|last> [filter]\n"); return 2; }
-    provoking_last = !strcmp(argv[2], "last");
+    if (argc < 3) { printf("usage: mesh_parity <spv dir> <auto|rotate> [filter]\n"); return 2; }
+    pv_ext = strcmp(argv[2], "rotate") != 0;   // init: and the driver has provokingVertexLast
     if (argc > 3) filter = argv[3];
     init(argv[1]);
-    printf("a mesh pipeline's flat input is expected from its triangle's %s vertex\n", provoking_last ? "last" : "first");
+    printf(pv_ext ? "flat inputs from the last vertex: both pipelines ask the driver (provokingVertexLast)\n"
+                  : "flat inputs from the last vertex: mesh triangles handed over last vertex first, the vertex pipeline's "
+                    "shader standing in; lines keep the first\n");
     provoking_info();
     char name[128];
     static const VkViewport views[3] = {{0, 0, W, H, 0, 1}, {0, H, W, -H, 0, 1}, {8, 56, 40, -48, 0.25f, 0.75f}};

@@ -76,6 +76,9 @@ static class AmpereLowering
     {
         public int Stage, Threads, MaxVertices, MaxPrimitives, Topology, PayloadBytes;
         public bool HasTask;
+        // The driver takes a flat fragment input from a primitive's first vertex (it has no provokingVertexLast), where
+        // the game expects the last vertex's: MeshSpirv.cs then writes each triangle's last vertex first.
+        public bool FlatFirst;
         // Output lines in order: Maxwell attribute address of each component (0x60.. system values, 0x80 + 16g + 4c
         // generic g component c).
         public readonly List<int> Lines = new();

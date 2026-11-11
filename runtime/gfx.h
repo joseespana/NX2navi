@@ -59,9 +59,9 @@ void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys
 void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   // disk cache reads on the render
                                                      // thread (count, ns) and by the loaders (gfx_shader.c load_budget)
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs,
-// atomic float add in storage buffers.
+// atomic float add in storage buffers, flat inputs taken from a primitive's first vertex (no provokingVertexLast).
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
-                         int bda, int float_atomic_add);
+                         int bda, int float_atomic_add, int flat_first);
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.

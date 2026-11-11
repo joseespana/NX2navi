@@ -9,7 +9,21 @@ This fetches MoltenVK at MVK_MAIN into toolchain/src/MoltenVK (local changes and
 merges the pull request's commit MVK_PR, pins SPIRV-Cross at SPIRV_CROSS (its mesh shader fixes, KhronosGroup/SPIRV-Cross
 pull request 2686, came after the revision MoltenVK pins), applies PATCHES, and builds with MoltenVK's own fetchDependencies and Makefile
 (Xcode). The build fetches MoltenVK's dependencies (SPIRV-Cross, SPIRV-Tools, SPIRV-Headers, Vulkan-Headers, cereal)
-from GitHub. libMoltenVK.dylib, its ICD manifest (MoltenVK_icd.json, naming the library by a relative path) and
+from GitHub.
+
+The build defines MVK_USE_METAL_PRIVATE_API=1 (MAKE_ARGS): MoltenVK then also calls Metal methods that are not in
+Apple's public headers, which an App Store application may not do and which Apple may change in any macOS release (each
+call is guarded by respondsToSelector, so a missing one is skipped). This game's renderer needs one of them:
+VK_EXT_provoking_vertex's provokingVertexLast (the encoder's setProvokingVertexMode:), because the game takes a flat
+fragment input from its primitive's last vertex and Metal's public API only from the first. The switch also brings:
+logicOp (the pipeline descriptor's logic operation; the back end uses it when the game asks for one), wideLines and
+the dynamic line width (the back end always draws lines 1 pixel wide), the static sample mask on the pipeline
+descriptor instead of in the fragment shader (the back end sets none), primitive restart that can be turned off and
+that follows the index type (VK_EXT_primitive_topology_list_restart; MoltenVK then also puts every render pass
+descriptor into Metal's "OpenGL mode", which unlocks that call), byte indices widened without their restart value
+rewritten, VK_EXT_non_seamless_cube_map and VK_EXT_legacy_dithering (the back end uses neither).
+
+libMoltenVK.dylib, its ICD manifest (MoltenVK_icd.json, naming the library by a relative path) and
 MoltenVK's LICENSE go to toolchain/moltenvk; with --install GAME they are copied to GAME/moltenvk, where the game's
 Vulkan loader takes them (runtime/vk_device.c moltenvk_beside_exe). Run with .venv, on macOS only.
 
@@ -32,6 +46,7 @@ MVK_PR = 'c516eb423516187204c68cd1ed82fb81520315eb'     # pull request 2842, "Ad
 MVK_PR_REF = 'pull/2842/head'
 SPIRV_CROSS = '57e4efcc84112abcd426dc5ec248b5339bee04f2'  # SPIRV-Cross main, 2026-10-28, with pull request 2686
 LIB = 'Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib'
+MAKE_ARGS = ['MVK_USE_METAL_PRIVATE_API=1']   # see the docstring: provokingVertexLast and what else it turns on
 
 # Changes made to the merged source, as (file, text, replacement); each text must occur once.
 #
@@ -439,7 +454,7 @@ def build(src):
     run(src, './fetchDependencies', '--none')
     apply(sc, SPIRV_CROSS_PATCHES)
     run(src, './fetchDependencies', '--macos')
-    run(src, 'make', 'macos')
+    run(src, 'make', 'macos', *MAKE_ARGS)
     lib = src / LIB
     if not lib.is_file():
         sys.exit(f'build_moltenvk: {lib} was not built')
@@ -454,7 +469,8 @@ def stage(src, out):
            'ICD': {'library_path': './libMoltenVK.dylib', 'api_version': '1.4.0', 'is_portability_driver': True}}
     (out / 'MoltenVK_icd.json').write_text(json.dumps(icd, indent=4) + '\n')
     (out / 'VERSION.txt').write_text(f'MoltenVK {MVK_MAIN} + pull request 2842 {MVK_PR}; SPIRV-Cross {SPIRV_CROSS}; '
-                                     f'{len(PATCHES)} local patches, {len(SPIRV_CROSS_PATCHES)} to SPIRV-Cross\n')
+                                     f'{len(PATCHES)} local patches, {len(SPIRV_CROSS_PATCHES)} to SPIRV-Cross; built with '
+                                     f'{" ".join(MAKE_ARGS)} (private Metal API calls)\n')
 
 
 def main():

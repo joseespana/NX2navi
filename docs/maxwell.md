@@ -116,7 +116,10 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
 
 1. **Provoking vertex.** Vulkan draws flat outputs from the first vertex, NVN from the last. `vk_pipeline.c` enables
    `provokingVertexLast` and chains `VkPipelineRasterizationProvokingVertexStateCreateInfoEXT{LAST_VERTEX}` in
-   `create_graphics`; without the feature it logs that flat outputs come from the first vertex. **Fixed.**
+   `create_graphics`; without the feature it logs that flat outputs come from the first vertex, and mesh programs
+   are then translated with the host option `flat_first` (`gfx_shader_set_host`, `tools/xlate/MeshSpirv.cs`), which
+   hands each triangle over last vertex first; vertex pipelines stay on the first vertex there. The game's own
+   MoltenVK on macOS has the feature (`tools/build_moltenvk.py`, the private Metal API build). **Fixed.**
 2. **Unwritten vertex outputs.** `spirv_add_outputs` (`vk_pipeline.c`) adds outputs initialised to (0, 0, 0, 1) for
    FS inputs the VS lacks. `gfx_shader.c` reflects the full declared location span of VS output and FS input arrays,
    not just their base location: an FS `vec4[16]` requires all 16 locations even when it only accesses some elements.

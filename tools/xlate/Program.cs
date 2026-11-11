@@ -9,7 +9,8 @@
 //   job: { "key", "stage": "vs|ps|cs", "code": path (graphics = 0x50-byte SPH + instructions, compute = instructions), "c1": hex,
 //          "sm86": bool + "size": bytes (an NVN2 program, lowered by AmpereLowering.cs), "nvn2_table": [start, textures,
 //          images] (NVN2 compute binding table), "lowered_out": path, "mesh": {"stage": 6|7, "threads", "maxv", "maxp",
-//          "topo", "payload", "task"} (stage "ts" / "ms": an NVN2 task or mesh program, AmpereLowering.MeshInfo),
+//          "topo", "payload", "task", "flat_first": bool} (stage "ts" / "ms": an NVN2 task or mesh program,
+//          AmpereLowering.MeshInfo; "flat_first": the driver takes flat inputs from a primitive's first vertex),
 //          "tex": {slot: {type, fmt}}, "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: float|sint|uint},
 //          "local": [x, y, z], "shared": bytes, "debug": bool, "reduced": bool, "softfloat64": bool, "zero_locals": bool,
 //          "float_atomic_add": bool, "sbuf_align": int, "subgroup": int }
@@ -186,6 +187,7 @@ static class SwshXlate
                             Stage = (int)mj["stage"], Threads = (int)mj["threads"], MaxVertices = (int)mj["maxv"],
                             MaxPrimitives = (int)mj["maxp"], Topology = (int)mj["topo"], PayloadBytes = (int)mj["payload"],
                             HasTask = mj["task"] is JsonValue tv && tv.TryGetValue<bool>(out bool tb) && tb,
+                            FlatFirst = mj["flat_first"] is JsonValue fv && fv.TryGetValue<bool>(out bool fb) && fb,
                         };
                         // The size field counts 256-byte units, and some task programs and the mesh programs they feed
                         // carry 0 there while the payload is used (the task writes the mesh count at +4, the mesh reads

@@ -145,8 +145,10 @@ void vk_caps_init(VkCtx *c) {
     // with one setting serve the other. NX2NAVI_ZERO_LOCALS=0 turns it off.
     uint32_t zero_locals = env_u32("NX2NAVI_ZERO_LOCALS", 1);
     // bda: global accesses the translator finds no storage buffer for go through the device address table (vk_gpa.c)
+    // flat_first: without provokingVertexLast a flat input comes from the first vertex where the game expects the
+    // last (vk_pipeline.c P.pv_last), and mesh programs are translated to hand their triangles over last vertex first.
     gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather, zero_locals != 0, vk_gpa_wanted_ctx(c),
-                        vk_caps.float_atomic_add);
+                        vk_caps.float_atomic_add, !(c->has_provoking_vertex && pvf.provokingVertexLast));
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (NX2NAVI_GATHER_BIAS)", gather);
 
     char dv[32];

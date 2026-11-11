@@ -160,7 +160,7 @@ static char cache_dir[PATH_CAP];
 static char xlate_exe[PATH_CAP];
 static uint8_t xlate_id[32];                               // translator identity (see the keys at the top)
 static uint8_t xlate_base[32];                             // the same before gfx_shader_set_host mixes in host options
-static int host_f64 = 1, host_float_atomic_add = 1, host_zero_locals, host_bda, host_set;   // gfx_shader_set_host
+static int host_f64 = 1, host_float_atomic_add = 1, host_zero_locals, host_bda, host_flat_first, host_set;   // gfx_shader_set_host
 static uint32_t host_sbuf, host_sg[3] = {32, 32, 32}, host_gather;
 static PlatOnce paths_once = PLAT_ONCE_INIT;
 
@@ -384,13 +384,14 @@ static void paths(void) { plat_once(&paths_once, init_paths, NULL); }
 // defaults, which are not mixed in.
 static int host_text(char *t) {
     if (host_f64 && !host_sbuf && host_sg[0] == 32 && host_sg[1] == 32 && host_sg[2] == 32 && !host_gather &&
-        host_float_atomic_add && !host_zero_locals && !host_bda)
+        host_float_atomic_add && !host_zero_locals && !host_bda && !host_flat_first)
         return 0;
     int n = snprintf(t, 96, "TKHO f64=%d sbuf=%u sg=%u,%u,%u", host_f64, host_sbuf, host_sg[0], host_sg[1], host_sg[2]);
     if (host_gather) n += snprintf(t + n, (size_t)(96 - n), " gather=%u", host_gather);
     if (host_zero_locals) n += snprintf(t + n, (size_t)(96 - n), " zero_locals");
     if (host_bda) n += snprintf(t + n, (size_t)(96 - n), " bda");
     if (!host_float_atomic_add) n += snprintf(t + n, (size_t)(96 - n), " no_float_atomic_add");
+    if (host_flat_first) n += snprintf(t + n, (size_t)(96 - n), " flat_first");
     return n;
 }
 
@@ -407,15 +408,15 @@ static void host_mix(const uint8_t base[32], uint8_t out[32]) {
 }
 
 // Host answers (vk_caps.c, at device creation, before any translation). Answers other than the defaults (Float64,
-// exact storage offsets, 32 lanes, no gather bias, undefined locals, no device address table, atomic float add) are
-// mixed into the translator identity, so they get their own cache keys. The previous identities of identities.txt get
+// exact storage offsets, 32 lanes, no gather bias, undefined locals, no device address table, atomic float add, flat
+// inputs from the last vertex) are mixed into the translator identity, so they get their own cache keys. The previous identities of identities.txt get
 // the same options mixed in (carry).
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
-                         int bda, int float_atomic_add) {
+                         int bda, int float_atomic_add, int flat_first) {
     paths();
     if (host_set++) return;
     host_f64 = float64, host_sbuf = sbuf_align, host_gather = gather_bits, host_zero_locals = zero_locals, host_bda = bda;
-    host_float_atomic_add = float_atomic_add;
+    host_float_atomic_add = float_atomic_add, host_flat_first = flat_first;
     memcpy(host_sg, subgroup, sizeof host_sg);
     char t[96];
     int n = host_text(t);
@@ -1564,9 +1565,11 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
             // mesh stage; +0x60 vertex limit (low 16 bits) and primitive limit (high 16 bits).
             uint32_t w58, w5c, w60;
             memcpy(&w58, control + 0x58, 4), memcpy(&w5c, control + 0x5c, 4), memcpy(&w60, control + 0x60, 4);
-            o += sprintf(o, ",\"mesh\":{\"stage\":%d,\"threads\":%u,\"payload\":%u,\"maxv\":%u,\"maxp\":%u,\"topo\":%u,\"task\":%s}",
+            // "flat_first": the driver takes a flat fragment input from a primitive's first vertex (no
+            // provokingVertexLast, gfx_shader_set_host), so the mesh program hands its triangles over last vertex first.
+            o += sprintf(o, ",\"mesh\":{\"stage\":%d,\"threads\":%u,\"payload\":%u,\"maxv\":%u,\"maxp\":%u,\"topo\":%u,\"task\":%s%s}",
                          !strcmp(stage, "ts") ? 6 : 7, w58 & 0xffff, (w58 >> 24) * 256, w60 & 0xffff, w60 >> 16, w5c >> 24,
-                         (w5c >> 16 & 0xff) ? "true" : "false");
+                         (w5c >> 16 & 0xff) ? "true" : "false", host_flat_first && !strcmp(stage, "ms") ? ",\"flat_first\":true" : "");
         }
         if (!strcmp(stage, "cs")) {
             // The compute binding table in the driver bank: texture entries (byte +0xb3), image entries (+0xb6), and

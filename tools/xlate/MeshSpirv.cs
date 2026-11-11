@@ -379,13 +379,14 @@ static class MeshSpirv
                         uint value = Emit(OpBitwiseAnd, tUint, Emit(OpShiftRightLogical, tUint, word, shift), C(0xff));
                         idx[j] = UMin(value, C((uint)maxV - 1));
                     }
-                    // macOS: a flat fragment input takes its value from the primitive's first vertex there (Metal's rule, and
-                    // the Vulkan driver has no provokingVertexLast), where the game expects the last vertex's, which the
-                    // back end asks for elsewhere (runtime/vk_pipeline.c P.pv_last). A triangle is handed over with its
-                    // last vertex first: (c, a, b) is triangle (a, b, c) with the same winding and, measured on an M1 Max,
-                    // the same pixels, depths and interpolated values (tests/mesh_parity.py). A line is left as it is: drawn
-                    // from its other end it covers other pixels, and the game has no mesh program that emits lines.
-                    if (OperatingSystem.IsMacOS() && ipp == 3) idx = new[] { idx[2], idx[0], idx[1] };
+                    // A driver without provokingVertexLast (m.FlatFirst; Metal through the public API) takes a flat fragment
+                    // input from the primitive's first vertex, where the game expects the last vertex's, which the back
+                    // end asks the driver for when it can (runtime/vk_pipeline.c P.pv_last). A triangle is then handed
+                    // over with its last vertex first: (c, a, b) is triangle (a, b, c) with the same winding and, measured
+                    // on an M1 Max, the same pixels, depths and interpolated values (tests/mesh_parity.py). A line is left
+                    // as it is: drawn from its other end it covers other pixels, and the game has no mesh program that
+                    // emits lines.
+                    if (m.FlatFirst && ipp == 3) idx = new[] { idx[2], idx[0], idx[1] };
                     uint composite = ipp == 1 ? idx[0] : Emit(OpCompositeConstruct, tIdx, idx);
                     Do(OpStore, Emit(OpAccessChain, pOutIdx, idxVar, p), composite);
                 });
