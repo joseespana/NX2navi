@@ -354,11 +354,11 @@ void vk_mem_merge_cpu_wait(uint64_t value);   // NX2NAVI_MERGE_CPU: the lists up
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).
 void vk_mem_shadow_sync(void);
-// Actual use of the device address table (vk_gpa.c), also with reused descriptors: the part's prologue copies the
-// CPU's writes into the shadow pools it names and keeps base copies of pages shaders wrote through the table.
-// Those pages go back into guest memory at the fence (vk_memory.c gw_part).
-void vk_mem_gpa_use(int how);
-void vk_mem_gpa_sync(uint64_t fence);
+// A shader of the part being recorded reads through the device address table (vk_gpa.c), also when its descriptors
+// are reused: with shadow storage the part's prologue (vk_mem_gpa_sync) then brings every pool the table names up to
+// date with the CPU's writes, since the pools such a shader reaches are never resolved.
+void vk_mem_gpa_use(void);
+void vk_mem_gpa_sync(void);
 int vk_mem_shadow_storage(void);   // CPU-visible pools are shadow copies of guest memory, not imports (NX2NAVI_SHADOW)
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
@@ -763,7 +763,7 @@ typedef struct {
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
     int pool;                              // a stage indexes the texture or sampler pool: bind set 2 (the pools)
-    int gpa;                               // 1: a stage reads through the device address table; 3: also writes
+    int gpa;                               // a stage accesses guest pointers through the device address table
 } VkPipeInfo;
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
