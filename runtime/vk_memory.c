@@ -102,6 +102,7 @@ static void mirror_forget(PoolRec *r);   // pool_lock exclusive: off the mirrore
 static void cpu_span_add(PoolRec *r, uint64_t lo, uint64_t hi, uint64_t fence);   // NX2NAVI_MERGE_CPU
 static uint64_t cpu_span_wait(const PoolRec *r, uint64_t lo, uint64_t hi, uint64_t fence);
 static int shadow_on;                    // shadow mode: imported pools get shadow storage instead (vk_mem_class_log)
+int vk_mem_shadow_storage(void) { return shadow_on; }
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
 static void shadow_touch(PoolRec *r);
 static void shadow_forget(PoolRec *r);
