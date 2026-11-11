@@ -98,7 +98,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   (`vk_exec_draw.c pool_sync`); slots that resolve alike share one lookup.
   Finalization is retained on registered slots independently of image-cache eviction: a stale CPU-backed descriptor
   cannot recreate an image from freed storage or follow newly reused CPU bytes. Registration makes it current again;
-  finalized descriptors may still follow live GPU-owned content.
+  finalized descriptors may still follow live GPU-owned content. A finalize marks none while another texture with the
+  same parameters is live at the storage, as the game reuses terrain heightmap storage that way
+  (`vk_backend.c vk_be_texture_release`), and only the slots registered before it (the asynchronous replay applies
+  releases late, registrations at once).
 - Texture views retain the guest descriptor's format when following live storage. Sampled, storage and attachment
   views declare only their actual Vulkan usage, with descriptor views checked against that format's capabilities:
   an sRGB sampled/attachment view never inherits a mutable UNORM image's storage usage.
