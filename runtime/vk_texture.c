@@ -712,13 +712,15 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
     // few seconds.
     static int depth_keep = -1;
     if (depth_keep < 0) depth_keep = rt_knob("DEPTH_KEEP", "1");
-    if ((e->f.depth || e->f.stencil) && !(e->bound_to && RT_KNOB_ON(depth_keep))) {
+    // Where a bound image's texels are its own (VkCtx.image_bytes_apart) the clear erases nothing else, and it is the
+    // only thing that zeroes the image (below).
+    if ((e->f.depth || e->f.stencil) && (!(e->bound_to && RT_KNOB_ON(depth_keep)) || vk_ctx()->image_bytes_apart)) {
         VkClearDepthStencilValue zero = {0.0f, 0};
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearDepthStencilImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
         barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     } else if (vk_fix_zero() && (!e->bound_to || vk_ctx()->image_bytes_apart) && !e->pub.mirrored &&
-               !format_compressed(e->f.vk)) {
+               !format_compressed(e->f.vk) && !e->f.depth && !e->f.stencil) {
         // GPU-only storage that got memory of its own starts at zero, as the pool it stands for (vk_memory.c
         // alloc_physical). Images aliasing pool memory are not cleared: that would erase what other textures rendered
         // there; mirrored images are uploaded from their storage on first use. Where a bound image's texels are not
