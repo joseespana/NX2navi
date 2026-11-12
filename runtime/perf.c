@@ -504,6 +504,20 @@ static void ft_report(uint64_t now, const char *tag) {
         rt_log("frametime: %s: %llu frames in %.1f s, mean %.1f fps, 1%% low %.1f fps, over 25 ms %llu, 50 ms %llu, 100 ms %llu",
                tag, (unsigned long long)ft.frames, (now - ft.t0) / 1e9, ft.frames * 1e9 / ft.sum, low ? 1e9 / low : 0.0,
                (unsigned long long)ft.over25, (unsigned long long)ft.over50, (unsigned long long)ft.over100);
+#ifdef __APPLE__
+        // Upper bounds from the existing 0.25 ms histogram; the final bin contains all longer frames.
+        const unsigned percentile[] = {50, 95, 99};
+        double upper[3] = {0};
+        for (int i = 0; i < 3; i++) {
+            uint64_t seen = 0, rank = (ft.frames * percentile[i] + 99) / 100;
+            for (int b = 0; b < FT_BINS; b++) {
+                if ((seen += ft.hist[b]) >= rank) { upper[i] = (b + 1) * 0.25; break; }
+            }
+        }
+        rt_log("frametime:   mean %.3f ms, histogram p50/p95/p99 %.2f/%.2f/%.2f ms "
+               "(0.25 ms upper bounds, values at %.2f ms include overflow)",
+               ft.sum / (double)ft.frames / 1e6, upper[0], upper[1], upper[2], FT_BINS * 0.25);
+#endif
         if (ft.over25) {
             char line[512];
             int n = snprintf(line, sizeof line, "frametime:   over 25 ms by cause:");

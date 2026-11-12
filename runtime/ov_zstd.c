@@ -756,6 +756,7 @@ int probe_zstd(void) {
 
 // NX2NAVI_TRACE=perf "mem: sizes" (perf.c): host dictionaries (never freed) and stream slots taken.
 void zstd_sizes(PerfSizes *s) {
+#ifdef RT_PATCH_PAGE
     uint64_t d, st = 0;
     plat_mutex_lock(&dict_lock);
     d = (uint64_t)ndicts;
@@ -765,4 +766,8 @@ void zstd_sizes(PerfSizes *s) {
     plat_mutex_unlock(&stream_lock);
     perf_size(s, "zstd dictionaries", d, NDICT, PERF_SIZE_NONE);
     perf_size(s, "zstd stream slots", st, NSTREAM, PERF_SIZE_NONE);
+#else
+    // Builds without a patch page have no host decoder or dictionary cache.
+    (void)s;
+#endif
 }

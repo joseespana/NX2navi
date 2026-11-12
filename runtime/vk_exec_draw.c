@@ -687,7 +687,7 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkFormatProperties fp;
-    vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, vf, &fp);
+    vk_format_properties(vf, &fp);
     VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
     if (!(fp.optimalTilingFeatures & need)) return VK_NULL_HANDLE;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
@@ -731,7 +731,7 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
         // DLSS (vk_dlaa.c) and contact shadows (vk_contact.c) also sample and store through these views: they keep the
         // image's sampled and storage usage where the view's format supports it (an sRGB view has no storage).
         VkFormatProperties fp;
-        vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, format, &fp);
+        vk_format_properties(format, &fp);
         if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
             use.usage |= img->usage & VK_IMAGE_USAGE_SAMPLED_BIT;
         if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
@@ -5792,7 +5792,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
     static int e5_blit = -1;   // E5B9G9R9 can be a blit source (with linear filtering)
     if (e5_blit < 0) {
         VkFormatProperties fp;
-        vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &fp);
+        vk_format_properties(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &fp);
         VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         e5_blit = (fp.optimalTilingFeatures & need) == need ? 1 + !!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) : 0;
         rt_log("vk_exec: RGB9E5 fallback decode %s", e5_blit ? "on" : "unavailable (E5B9G9R9 is no blit source here)");

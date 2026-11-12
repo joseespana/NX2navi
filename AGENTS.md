@@ -35,3 +35,13 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 ## Writing
 
 Code, comments, docs and commit messages are in English. Commit messages are plain sentences without type prefixes.
+
+## Local Codex workflows
+
+The local Codex copies of the macOS workflows live in `.agents/skills/`; the original Claude setup stays in `.claude/`.
+For macOS rendering, GPU faults or performance work, read `.agents/skills/metal-debug/SKILL.md` when present.
+Use `.agents/skills/mac-test-run/SKILL.md` for game runs and `.agents/skills/moltenvk-patch/SKILL.md` for driver patches.
+The specialized agent is `.codex/agents/mac-renderer.toml`; when working directly, its `developer_instructions` also
+provide the Mac investigation workflow. These local files may be absent in other checkouts.
+Keep Mac-specific fixes isolated from Windows and Linux, and distinguish historical observations from current evidence.
+Preserve existing test profiles and use a new output directory for every run. Talk to the user in Spanish.

@@ -96,6 +96,8 @@ int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
 void vk_caps_float_atomics(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT *f);
 void vk_caps_init(VkCtx *c);                          // after it: pretend limits, fallbacks, the boot report
 
+// Call while the device is alive, as for other device queries.
+void vk_format_properties(VkFormat format, VkFormatProperties *properties);
 VkCtx *vk_ctx(void);                        // NULL until vk_init() succeeded
 int vk_init(void);                          // idempotent; 1 on success, 0 on failure (reason logged with rt_log)
 void vk_shutdown(void);
@@ -899,7 +901,7 @@ PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void);
 // Probe only: 1 selects stage-independent layouts for pipelines looked up from now on, 0 the shared set 0; returns
 // the previous mode. 1 needs vk_caps.gpl (the independent-sets flag comes with the extension).
 int vk_pipeline_set_indep(int on);
-typedef struct { uint64_t graphics, compute, failures, hits, layouts, push_layouts, async_built, pending_skips; } VkPipeStats;
+typedef struct { uint64_t graphics, compute, failures, hits, layouts, push_layouts, async_built, pending_skips, shared_rejected, shared_skips; } VkPipeStats;
 void vk_pipeline_stats(VkPipeStats *s);
 void vk_pipeline_save(void);               // writes the VkPipelineCache to pipeline-cache.bin next to nx2navi.exe
 void vk_pipeline_autosave(void);           // vk_pipeline_save at most every 20 s, when pipelines were built since

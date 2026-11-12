@@ -46,6 +46,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_hmap.h"
+#include "nvn_api.h"
 #include "platform/platform.h"
 #include "prp_file.h"
 #include "tex.h"
@@ -126,6 +127,7 @@ static struct {
     char cache_path[PLAT_PATH_MAX * 2];
     char play_path[PLAT_PATH_MAX * 2 + 8];   // pipeline-cache-play.bin beside cache_path
     VkPipeStats stats;
+    uint64_t draw_build_ns, draw_job_wait_ns;
 } P = {.lock = PLAT_MUTEX_INIT};
 
 typedef struct Layout {
@@ -152,6 +154,7 @@ typedef struct Pipe {
     struct Job *job;                   // that job while building
     const struct Layout *lay;          // graphics: the layout it was entered with
     VkPipeline fast;                   // GPL: the fast-linked pipeline (kept until shutdown: recorded draws use it)
+    uint8_t shared_rejected;           // permanently refused by the shared-memory limit
     uint8_t fast_tried;
     uint8_t link_queued;               // a waiting draw queued its fast link to the workers (LibJob p), not yet run
     uint8_t used;                      // compute: a dispatch of this run asked for it (vk_pipeline_compute)
@@ -764,10 +767,11 @@ static void *cache_data_read(VkCtx *c, const char *path, size_t *size) {
     }
     VkPipelineCacheHeaderVersionOne h;
     memcpy(&h, data, sizeof h);
-    if (h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || h.vendorID != c->props.vendorID ||
+    if (h.headerSize < sizeof h || h.headerSize > len || h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || h.vendorID != c->props.vendorID ||
         h.deviceID != c->props.deviceID || memcmp(h.pipelineCacheUUID, c->props.pipelineCacheUUID, VK_UUID_SIZE)) {
-        rt_log("vk_pipeline: %s (%.1f MB) was written by another device or driver; starting empty", path,
-               len / 1048576.0);
+        rt_log("vk_pipeline: %s (%llu bytes): incompatible cache header (size=%u version=%u vendor=%u device=%u UUID match=%d); starting empty", path,
+               (unsigned long long)len, h.headerSize, h.headerVersion, h.vendorID, h.deviceID,
+               !memcmp(h.pipelineCacheUUID, c->props.pipelineCacheUUID, VK_UUID_SIZE));
         free(data);
         return NULL;
     }
@@ -782,12 +786,20 @@ static VkPipelineCache cache_make(VkCtx *c, const void *data, size_t size, size_
     VkPipelineCache cache = VK_NULL_HANDLE;
     VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = size,
                                     .pInitialData = size ? data : NULL};
-    if (vkCreatePipelineCache(c->device, &ci, NULL, &cache) != VK_SUCCESS) {
+    VkResult first = vkCreatePipelineCache(c->device, &ci, NULL, &cache), retry = VK_SUCCESS;
+    if (first != VK_SUCCESS) {
         ci.initialDataSize = 0, ci.pInitialData = NULL;
-        if (vkCreatePipelineCache(c->device, &ci, NULL, &cache) != VK_SUCCESS) cache = VK_NULL_HANDLE;
+        retry = vkCreatePipelineCache(c->device, &ci, NULL, &cache);
+        if (retry != VK_SUCCESS) cache = VK_NULL_HANDLE;
     }
     *kept = 0;
-    if (cache && vkGetPipelineCacheData(c->device, cache, kept, NULL) != VK_SUCCESS) *kept = 0;
+    VkResult query = cache ? vkGetPipelineCacheData(c->device, cache, kept, NULL) : VK_ERROR_INITIALIZATION_FAILED;
+    if (query != VK_SUCCESS) *kept = 0;
+    rt_log("vk_pipeline: cache create: input=%llu bytes, result=%d, empty retry=%d (result=%d), "
+           "size query=%d, returned=%llu bytes%s", (unsigned long long)size, (int)first,
+           first != VK_SUCCESS, (int)retry, (int)query, (unsigned long long)*kept,
+           size > sizeof(VkPipelineCacheHeaderVersionOne) && first == VK_SUCCESS && query == VK_SUCCESS &&
+           *kept <= sizeof(VkPipelineCacheHeaderVersionOne) ? "; accepted but no payload reported" : "");
     return cache;
 }
 
@@ -4111,7 +4123,9 @@ static void job_wanted(Job *j, uint32_t wait_ms) {
         j->next = j->prev = NULL;
         j->worker = JOB_ON_DRAW;
         A.taken++;
+        uint64_t t0 = plat_now_ns();
         job_build(j, 0);
+        P.draw_build_ns += plat_now_ns() - t0;
         return;
     }
     if (q) {   // to the head
@@ -4122,8 +4136,8 @@ static void job_wanted(Job *j, uint32_t wait_ms) {
     plat_cond_signal(&work_cv);
 }
 
-// Enters a missing pipeline: built here (mode 0), or queued for a draw (1) or for the prebuild (2). Failures are
-// entered too. *queued: 1 when a job owns it. Caller holds P.lock.
+// Enters a missing pipeline: built here (mode 0), or queued for a draw (1), prebuild (2), or bounded draw (3). Failures are
+// entered too. *queued: 1 when a job owns it, -1 when a bounded request must retry. Caller holds P.lock.
 // Bytes of the module's Workgroup variables, for the translator's shared memory arrays of 32-bit words (MeshSpirv.cs:
 // one per mesh or task stage); UINT32_MAX when one is of another shape.
 static uint32_t spirv_workgroup_bytes(const GfxShader *sh) {
@@ -4179,6 +4193,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     uint32_t span = binding_span(s->vs);
     int mesh = is_mesh(s);
     char shared_why[96];
+    int shared_rejected = 0;
     if (mesh) {
         // Mesh draws (VK_EXT_mesh_shader): one set holding the mesh stage's bindings, the fragment stage's after them and
         // the task stage's after those (create_graphics renumbers both modules); no libraries (the GPL fast link is for
@@ -4187,7 +4202,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         uint32_t fspan = s->fs ? binding_span(s->fs) : 1;
         if (!vk_ctx()->has_mesh_shader) why = "the GPU has no mesh shaders";
         else if (s->ts && !vk_ctx()->has_task_shader) why = "the GPU has no task shaders";
-        else if (!mesh_shared_fits(s, shared_why, sizeof shared_why)) why = shared_why;
+        else if (!mesh_shared_fits(s, shared_why, sizeof shared_why)) why = shared_why, shared_rejected = 1;
         else if ((s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) || (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS)) why = "stage mismatch";
         else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1)) ||
                  (s->ts && !add_stage(&B, s->ts, span - 1 + fspan - 1))) why = "too many bindings";
@@ -4208,17 +4223,26 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     Job *j = NULL;
     if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
         *j = (Job){.l = l, .fs_off = span - 1, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
-    } else if (!why && !(pipe = create_graphics(s, k, l, span - 1))) {
-        why = "pipeline creation failed";
+    } else if (!why && mode == 3) {
+        // A bounded draw retries later if a worker or job could not be obtained.
+        *queued = -1;
+        return NULL;
+    } else if (!why) {
+        uint64_t t0 = plat_now_ns();
+        pipe = create_graphics(s, k, l, span - 1);
+        P.draw_build_ns += plat_now_ns() - t0;
+        if (!pipe) why = "pipeline creation failed";
     }
     if (why) {
         P.stats.failures++;
-        rt_log("vk_pipeline: graphics pipeline not built: %s", why);
+        if (!shared_rejected || ++P.stats.shared_rejected <= 16)
+            rt_log("vk_pipeline: graphics pipeline %016llx not built: %s", (unsigned long long)h, why);
     } else if (!j) {
         P.stats.graphics++;
         if (mode != 2) keys_note(s);
     }
     Pipe *p = pipe_add(k, sizeof *k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, gfx_shader_inputs(s->vs, NULL));
+    if (p) p->shared_rejected = shared_rejected;
     if (!j || !p) {
         free(j);
         return p;
@@ -4316,7 +4340,7 @@ static int link_queue(Pipe *p, const VkPipeState *s, const GKey *k, Layout *l) {
     return 1;
 }
 
-static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end) {
+static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end, int may_build) {
     Lib *b[2];
     if (!lib_queue(s, k, l, b)) return;
     double steal_at = now_ms() + 1.0;
@@ -4328,12 +4352,12 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
             return;
         }
         Lib *q = b[0]->job ? b[0] : b[1]->job ? b[1] : NULL;
-        if (q && !U.lib_workers && (now >= steal_at || !U.idle)) {
+        if (may_build && q && !U.lib_workers && (now >= steal_at || !U.idle)) {
             U.stolen++;
             lib_steal(q);   // releases P.lock while building
             continue;
         }
-        double until = q && steal_at < end ? steal_at : end;
+        double until = may_build && q && now < steal_at && steal_at < end ? steal_at : end;
         plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(until - now) + 1);
     }
 }
@@ -4381,13 +4405,22 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     GKey k;
     gkey_fill(s, &k);
     uint64_t h = key_hash(&k, sizeof k);
+    uint64_t request_at = plat_now_ns();
     plat_mutex_lock(&P.lock);
+    uint64_t locked_at = plat_now_ns();
+    // Keep bounded replay requests on workers on the portability renderer.
+#ifdef __APPLE__
+    int bounded = async && wait_ms <= TAKE_WAIT_MS;
+#else
+    int bounded = 0;
+#endif
+    double end = bounded && wait_ms ? now_ms() + wait_ms - (locked_at - request_at) / 1e6 : 0;
     Pipe *p = pipe_find(&k, sizeof k, h);
-    int queued;
+    int queued = 0;
     if (p) {
         if (!p->building) P.stats.hits++;
     } else {
-        p = pipe_miss(s, &k, h, async, &queued);
+        p = pipe_miss(s, &k, h, bounded ? 3 : async, &queued);
     }
     // A draw that would wait (wait_ms) gets its missing shader libraries built at once, the vertex and fragment ones in
     // parallel on idle workers (lib_wait; about 0.12 ms per library from the driver's disk cache, 5-180 ms cold), and
@@ -4403,7 +4436,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
                       : "builds its libraries itself (NX2NAVI_PIPE_WAIT=draw)");
     }
-    double end = wait_ms ? now_ms() + wait_ms : 0;
+    if (!bounded) end = wait_ms ? now_ms() + wait_ms : 0;
     if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && !p->link_queued && p->lay && !is_mesh(s) &&
         wait_ms && draw_build && U.on && link_queue(p, s, &k, (Layout *)p->lay)) {
         // the libraries and the link on the library workers; this thread waits below without building
@@ -4411,11 +4444,11 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         job_lower(p->job);
     } else if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && !p->link_queued && p->lay &&
                !is_mesh(s)) {
-        int final = 0, build = wait_ms != 0 && draw_build;
+        int final = 0, build = wait_ms != 0 && draw_build && (U.on || !bounded);
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {
             job_lower(p->job);   // its worker would only wait for the same libraries; it links them if this draw cannot
-            lib_wait(s, &k, (Layout *)p->lay, end);   // releases P.lock while waiting
+            lib_wait(s, &k, (Layout *)p->lay, end, !bounded);   // releases P.lock while waiting
             build = 0;                                // links here when both libraries exist (gpl_link build 0)
         } else if (build) {
             p->fast_tried = 1;   // the job, if a worker takes it meanwhile, goes straight to the optimised build
@@ -4444,12 +4477,31 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         uint64_t p0 = wait_ms ? perf_begin() : 0;   // the wait counts as the render thread's pipeline time
         double now;
         if (wait_ms) job_wanted(p->job, wait_ms);   // releases P.lock when it builds the job here
+        uint64_t wait_at = plat_now_ns();
         while (p->building && !p->info.pipeline && wait_ms && (now = now_ms()) < end)
             plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(end - now) + 1);
+        P.draw_job_wait_ns += plat_now_ns() - wait_at;
         if (wait_ms) perf_end(PERF_PIPE, p0);
         if (wait_ms && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
     }
-    int wait = p && p->building && !p->info.pipeline;
+    int wait = queued == -1 || (p && p->building && !p->info.pipeline);
+    if (p && p->shared_rejected) P.stats.shared_skips++;
+    static uint64_t report_at, requests, lock_ns, request_ns, report_frame;
+    requests++;
+    lock_ns += locked_at - request_at;
+    request_ns += plat_now_ns() - request_at;
+    if (plat_now_ns() - report_at >= 10000000000ull) {
+        uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        rt_log("vk_pipeline: frame=%llu, requests/frame=%.1f, draw requests=%llu, total=%.3f ms, lock wait=%.3f ms, synchronous builds=%.3f ms, job waits=%.3f ms; "
+               "shared-memory rejected pipelines=%llu, skipped draws=%llu (cumulative)",
+               (unsigned long long)frame, frame > report_frame ? (double)requests / (frame - report_frame) : 0.0,
+               (unsigned long long)requests, request_ns / 1e6, lock_ns / 1e6, P.draw_build_ns / 1e6, P.draw_job_wait_ns / 1e6,
+               (unsigned long long)P.stats.shared_rejected, (unsigned long long)P.stats.shared_skips);
+        requests = lock_ns = request_ns = 0;
+        P.draw_build_ns = P.draw_job_wait_ns = 0;
+        report_at = plat_now_ns();
+        report_frame = frame;
+    }
     if (wait) P.stats.pending_skips++;
     VkPipeline pipe = p ? p->info.pipeline : VK_NULL_HANDLE;
     plat_mutex_unlock(&P.lock);

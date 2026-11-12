@@ -24,6 +24,27 @@ static uint32_t g_gfx_queues = 1;   // queues the graphics family offers (pick_d
 
 static VkCtx g_vk;
 static int g_ready;
+// Entries include unsupported formats and are discarded with the physical device.
+static struct { VkFormat format; VkFormatProperties properties; } format_cache[256];
+static unsigned format_cache_count;
+static PlatMutex format_lock = PLAT_MUTEX_INIT;
+
+void vk_format_properties(VkFormat format, VkFormatProperties *properties) {
+    plat_mutex_lock(&format_lock);
+    for (unsigned i = 0; i < format_cache_count; i++) {
+        if (format_cache[i].format == format) {
+            *properties = format_cache[i].properties;
+            plat_mutex_unlock(&format_lock);
+            return;
+        }
+    }
+    vkGetPhysicalDeviceFormatProperties(g_vk.phys, format, properties);
+    if (format_cache_count < sizeof format_cache / sizeof *format_cache) {
+        format_cache[format_cache_count].format = format;
+        format_cache[format_cache_count++].properties = *properties;
+    }
+    plat_mutex_unlock(&format_lock);
+}
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
 // The fence vk_device_lost_poll asks about. Nothing submits with it, so its status is "not ready" for as long as the
 // device lives.
@@ -620,6 +641,9 @@ static void destroy_all(void) {
     }
     if (g_vk.instance) vkDestroyInstance(g_vk.instance, NULL);
     g_errors_total += g_vk.validation_errors;
+    plat_mutex_lock(&format_lock);
+    format_cache_count = 0;
+    plat_mutex_unlock(&format_lock);
     memset(&g_vk, 0, sizeof g_vk);
 }
 
@@ -628,7 +652,10 @@ long vk_validation_errors_total(void) { return g_errors_total + (g_ready ? g_vk.
 int vk_init(void) {
     plat_mutex_lock(&g_lock);
     if (!g_ready) {
-        memset(&g_vk, 0, sizeof g_vk);
+        plat_mutex_lock(&format_lock);
+    format_cache_count = 0;
+    plat_mutex_unlock(&format_lock);
+    memset(&g_vk, 0, sizeof g_vk);
         if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start(), vk_dlaa_init();
         else destroy_all();
     }

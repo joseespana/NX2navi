@@ -445,6 +445,37 @@ loss at the same moment end the process with exit code 72, one device report and
 device and opens no window; the device is not really lost, so what a driver answers after a loss is not covered.
 `device_lost_at = <n>` in `nx2navi.ini` ends a real run the same way at its n-th hand-over to the GPU queue.
 
+A change to bounded library waits (`runtime/vk_pipeline.c` `lib_wait`) passes
+`python tests/pipeline_wait_check.py`. It exercises the runtime function with a deterministic clock and queue:
+with all workers busy, bounded requests leave compilation queued and time out; unlimited requests can build on
+the caller; ready libraries return immediately. No GPU or game files.
+
+A change to the format properties cache (`runtime/vk_device.c` `vk_format_properties`) passes
+`python tests/format_properties_check.py` with a pthread-capable C compiler. Eight concurrent callers query each
+format once, including unsupported formats; a full cache still returns the driver's properties, and device teardown
+discards cached entries before another device is used. No GPU or game files.
+
+Pipeline diagnostics report exact cache input and returned sizes, creation and size-query results, and empty-cache
+retries. A successful create with only a header returned is reported separately from header incompatibility.
+Every ten seconds of draw requests, the log reports request time, lock waits, synchronous full builds and job waits,
+plus cumulative shared-memory rejection and skipped-draw counts. Library/link timings remain in the GPL diagnostics.
+On macOS the frame-time summary also reports mean time and histogram p50/p95/p99 bounds at 0.25 ms resolution;
+the final bucket includes overflow, so use the worst-frame records for longer stalls.
+To compare persistent caches, use two starts of the same executable, translator and driver and retain the cache
+between starts. Compare prewarm time as well as size and feedback; returned size alone does not prove reuse.
+For CPU merge comparisons, use `NX2NAVI_MERGE_CPU=0` and `1` on the same route with warm caches. The existing
+`mem: mirror frame` diagnostics report lists, words, application time and replay waits. Check missing draws and
+visual parity alongside frame times before changing the default.
+Check the memory mode first: with imported pools and no VRAM mirrors, the CPU merge route is inactive, so changing
+`NX2NAVI_MERGE_CPU` does not compare two write-back implementations in that run.
+
+The macOS driver patches in `tools/build_moltenvk.py` keep an individual cached shader compilation failure from
+invalidating the whole pipeline cache, and omit uncompiled libraries from saved caches. Archive read failures still
+fail the cache load. Validate a change to these patches with two `--probe-prewarm` runs using the same executable,
+translator and driver, retaining the cache between them. Check creation results and prewarm times alongside failed
+shader counts: the cache fix does not repair shaders that cannot compile. Cache-hit feedback may remain zero even
+when the cache is reused; a zero hit count alone is not evidence that the data was discarded.
+
 A change to the memory gate of the background pipeline builds (`runtime/vk_build_gate.h`, `runtime/vk_pipeline.c`
 `gate_enter`) passes `python tests\build_gate_check.py [<game exe>]`, which builds the header alone and checks what it
 admits and refuses and that builds under way count through their reservations. With the executable it also runs

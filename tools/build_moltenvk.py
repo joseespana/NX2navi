@@ -65,6 +65,36 @@ MESH_BLOCKS = 8   # indirect draws: up to 8192 workgroups
 MSL_VERSION = 4   # one more with each change to SPIRV_CROSS_PATCHES: 1 mesh positions flipped, 2 outputs per thread,
                   # 3 unwritten fragment inputs, 4 mesh positions' depth range
 PATCHES = [
+    # A failed shader library must not invalidate every usable entry at the next cache load.
+    # Read failures remain fatal; only an individual library compilation failure is recoverable.
+    # Failed libraries are omitted from serialization so the next start does not retry them at boot.
+    ('MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm',
+     '\tMVKShaderLibrary* shLib = new MVKShaderLibrary(_owner, resultInfo, compressedMSL);\n'
+     '\t_shaderLibraries.emplace_back(*pShaderConfig, shLib);',
+     '\tMVKShaderLibrary* shLib = new MVKShaderLibrary(_owner, resultInfo, compressedMSL);\n'
+     '\tif (!shLib->_mtlLibrary) {\n'
+     '\t\t// A cached source that cannot compile contributes no usable library.\n'
+     '\t\tshLib->destroy();\n'
+     '\t\treturn nullptr;\n'
+     '\t}\n'
+     '\t_shaderLibraries.emplace_back(*pShaderConfig, shLib);'),
+    ('MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm',
+     '\t\t\t\t\tslCache->addShaderLibrary(&shaderConversionConfig, resultInfo, compressedMSL);',
+     '\t\t\t\t\tVkResult before = getConfigurationResult();\n'
+     '\t\t\t\t\tif (!slCache->addShaderLibrary(&shaderConversionConfig, resultInfo, compressedMSL) &&\n'
+     '\t\t\t\t\t\tbefore == VK_SUCCESS && getConfigurationResult() == VK_ERROR_INITIALIZATION_FAILED) {\n'
+     '\t\t\t\t\t\t// A shader compile failure is local to this entry, not a corrupt archive.\n'
+     '\t\t\t\t\t\tclearConfigurationResult();\n'
+     '\t\t\t\t\t\tMVKLogInfo("Pipeline cache: skipped a shader library that failed to compile.");\n'
+     '\t\t\t\t\t}'),
+    ('MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm',
+     '\tbool next() { return (++_index < (_pSLCache ? _pSLCache->_shaderLibraries.size() : 0)); }',
+     '\tbool next() {\n'
+     '\t\twhile (++_index < (_pSLCache ? _pSLCache->_shaderLibraries.size() : 0)) {\n'
+     '\t\t\tif (_pSLCache->_shaderLibraries[_index].second->_mtlLibrary) { return true; }\n'
+     '\t\t}\n'
+     '\t\treturn false;\n'
+     '\t}'),
     (SHADERS,
      '[[object]] void objCmdDrawMeshTasks(const device MTLDispatchThreadgroupsIndirectArguments& args [[buffer(0)]],\n'
      '                                    mesh_grid_properties grid) {\n'

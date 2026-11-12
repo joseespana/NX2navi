@@ -66,6 +66,7 @@ __pycache__/
 # the maintainer's machine. tools/worktree.py links .claude and notes into task worktrees.
 /.claude/
 /.agents/
+/.codex/
 /CLAUDE.local.md
 /skills-lock.json
 /notes/
