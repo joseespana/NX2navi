@@ -5625,6 +5625,29 @@ static int mesh_ahead_on(void) {
     return RT_KNOB_ON(mode);
 }
 
+// NX2NAVI_MESH_RING_GROUP (macOS only; default 0 = fill and copy entry by entry as everywhere else, 1 = grouped): a ring
+// entry is a fill (the two group counts that are always 1) and a copy (the record's first count). Metal has one encoder open per
+// command buffer and runs a buffer fill in a compute encoder and a buffer copy in a blit encoder, so an entry after
+// another made two encoders each, and every encoder is a piece of GPU work scheduled by itself: in Kokiri Forest about
+// 33 entries a frame, filled in about 5 calls, were 66 of the frame's 600 encoders, each after 13 to 25 us of idle GPU
+// (Metal System Trace, 2026-11-12; the frame was 2% shorter with the switch, 32.6 ms for 33.3). With the
+// switch the fills of a call are recorded first and its copies after them, one encoder of each kind per call. The
+// commands and their arguments are the same and none of them reads or writes what another writes: the fills write
+// bytes 4..11 of distinct entries, the copies bytes 0..3 of the same entries from the game's buffers.
+// Off by default: on the day it was measured the GPU hung ("MMU interrupt") in 4 of 11 runs with the switch and in 1
+// of 15 without, in runs that differed in other settings too. The same hang came in runs without the switch later
+// that day and then in none of 20 runs of either kind, so it depends on the machine's state; no way the order could
+// cause one is known, but the two are not told apart yet.
+#ifdef __APPLE__
+static int mesh_ring_group(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("MESH_RING_GROUP", "0");
+    return RT_KNOB_ON(mode);
+}
+#else
+static int mesh_ring_group(void) { return 0; }
+#endif
+
 static int mesh_ring_entry(VkExec *ex, const p_draw_mesh_ind *d, const VkMemSpan *src, VkDeviceSize *at) {
     DrawCtx *const cx = ex->dc;
     if ((rt_trace & RT_TRACE_PERF) && (mesh_ahead_taken + mesh_ahead_own) % 20000 == 19999) {
@@ -5647,10 +5670,17 @@ static int mesh_ring_entry(VkExec *ex, const p_draw_mesh_ind *d, const VkMemSpan
     *at = 12ull * (__atomic_fetch_add(&mesh_ring_next, 1, __ATOMIC_RELAXED) % MESH_RING);
     vk_exec_barrier(ex);   // ends the pass (the next draw opens it again) and orders the culling's writes before the copy
     vk_gpu_gap_note(VK_GAP_MESH_RING, 12);
+    const int group = mesh_ring_group();   // the copies after all the fills (above)
+    struct { VkMemSpan src; VkDeviceSize at; } late[MESH_AHEAD + 1];
+    int nlate = 0;
     vkCmdFillBuffer(ex->cb, mesh_ring, *at + 4, 8, 1);
-    VkBufferCopy cp = {src->offset, *at, 4};
-    vkCmdCopyBuffer(ex->cb, src->buffer, mesh_ring, 1, &cp);
-    mesh_count_note(ex, src);
+    if (group) {
+        late[nlate].src = *src, late[nlate++].at = *at;
+    } else {
+        VkBufferCopy cp = {src->offset, *at, 4};
+        vkCmdCopyBuffer(ex->cb, src->buffer, mesh_ring, 1, &cp);
+        mesh_count_note(ex, src);
+    }
     cx->ma_n = cx->ma_i = 0;
     if (mesh_ahead_on()) {
         const void *run[MESH_AHEAD];
@@ -5663,14 +5693,23 @@ static int mesh_ring_entry(VkExec *ex, const p_draw_mesh_ind *d, const VkMemSpan
             VkDeviceSize fa = 12ull * (__atomic_fetch_add(&mesh_ring_next, 1, __ATOMIC_RELAXED) % MESH_RING);
             vk_gpu_gap_note(VK_GAP_MESH_RING, 12);
             vkCmdFillBuffer(ex->cb, mesh_ring, fa + 4, 8, 1);
-            VkBufferCopy fc = {ip.offset, fa, 4};
-            vkCmdCopyBuffer(ex->cb, ip.buffer, mesh_ring, 1, &fc);
-            mesh_count_note(ex, &ip);
+            if (group) {
+                late[nlate].src = ip, late[nlate++].at = fa;
+            } else {
+                VkBufferCopy fc = {ip.offset, fa, 4};
+                vkCmdCopyBuffer(ex->cb, ip.buffer, mesh_ring, 1, &fc);
+                mesh_count_note(ex, &ip);
+            }
             ex->recorded += 2;
             cx->ma[cx->ma_n].d = f, cx->ma[cx->ma_n].ind = f->ind, cx->ma[cx->ma_n].at = fa;
             cx->ma_n++;
         }
         cx->ma_brk = vk_exec_brk_now();
+    }
+    for (int i = 0; i < nlate; i++) {   // in the order of the entries, as without the switch
+        VkBufferCopy cp = {late[i].src.offset, late[i].at, 4};
+        vkCmdCopyBuffer(ex->cb, late[i].src.buffer, mesh_ring, 1, &cp);
+        mesh_count_note(ex, &late[i].src);
     }
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
