@@ -5625,7 +5625,7 @@ static int mesh_ahead_on(void) {
     return RT_KNOB_ON(mode);
 }
 
-// NX2NAVI_MESH_RING_GROUP (macOS only; default 0 = fill and copy entry by entry as everywhere else, 1 = grouped): a ring
+// NX2NAVI_MESH_RING_GROUP (macOS only; default 1 = grouped, 0 = fill and copy entry by entry as everywhere else): a ring
 // entry is a fill (the two group counts that are always 1) and a copy (the record's first count). Metal has one encoder open per
 // command buffer and runs a buffer fill in a compute encoder and a buffer copy in a blit encoder, so an entry after
 // another made two encoders each, and every encoder is a piece of GPU work scheduled by itself: in Kokiri Forest about
@@ -5634,14 +5634,14 @@ static int mesh_ahead_on(void) {
 // switch the fills of a call are recorded first and its copies after them, one encoder of each kind per call. The
 // commands and their arguments are the same and none of them reads or writes what another writes: the fills write
 // bytes 4..11 of distinct entries, the copies bytes 0..3 of the same entries from the game's buffers.
-// Off by default: on the day it was measured the GPU hung ("MMU interrupt") in 4 of 11 runs with the switch and in 1
-// of 15 without, in runs that differed in other settings too. The same hang came in runs without the switch later
-// that day and then in none of 20 runs of either kind, so it depends on the machine's state; no way the order could
-// cause one is known, but the two are not told apart yet.
+// On by default since play showed the gain. On the day it was measured the GPU hung ("MMU interrupt") in 4 of 11 runs
+// with the switch and in 1 of 15 without, in runs that differed in other settings too; the same hang came in runs
+// without it later that day and then in none of 20 runs of either kind, so it depends on the machine's state and no
+// way the order could cause one is known. NX2NAVI_MESH_RING_GROUP=0 restores the old order to tell them apart.
 #ifdef __APPLE__
 static int mesh_ring_group(void) {
     static int mode = -1;
-    if (mode < 0) mode = rt_knob("MESH_RING_GROUP", "0");
+    if (mode < 0) mode = rt_knob("MESH_RING_GROUP", "1");
     return RT_KNOB_ON(mode);
 }
 #else
