@@ -3,6 +3,7 @@
 // later (os_sync_wait_on_address).
 #define _DARWIN_C_SOURCE
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <crt_externs.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -20,6 +21,7 @@
 #include <os/os_sync_wait_on_address.h>
 #include <poll.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
@@ -76,7 +78,60 @@ struct PlatThread {
     void *arg;
     volatile int32_t done;   // fn has returned (plat_thread_join_ns)
     char name[32];
+    int home;                // QOS_HOME_* from the name (plat_thread_qos on), else QOS_HOME_NONE
+    pthread_override_t boost;   // another thread's raise (plat_thread_set_priority, QoS on); NULL none
 };
+
+// ---- quality of service
+// Apple silicon has performance and efficiency cores, and the scheduler picks a core by a thread's quality-of-service
+// class: user-interactive and user-initiated threads are kept on the performance cores while those have room,
+// utility threads go to whichever is free, background threads run on the efficiency cores only (and their file I/O
+// is throttled). A thread with no class runs as the default class. Precedence importance (set_importance below) does
+// not take part in that choice, and macOS drops a thread's class for good once a precedence policy is set on it
+// (pthread_set_qos_class_self_np fails from then on), so with plat_thread_qos on the priority calls set classes and
+// never a precedence policy. A thread's home class comes from its name at creation.
+enum { QOS_HOME_NONE, QOS_HOME_CRIT, QOS_HOME_BG };
+static int qos_on;
+static __thread PlatThread *qos_self;   // the calling thread's handle when plat_thread_new made it
+
+void plat_thread_qos(int on) { qos_on = on; }
+
+static int name_is(const char *name, const char *const *list) {
+    for (; *list; list++)
+        if (!strncmp(name, *list, strlen(*list))) return 1;
+    return 0;
+}
+
+// Prefixes of thread names (the plat_thread_new callers). Critical: what a frame waits for (the game's own threads,
+// the replay, recorder, completion and present threads, audio, input). Background: work a frame does not wait for
+// in play, or waits for only after raising the thread itself (the shader and pipeline workers, gfx_shader.c and
+// vk_pipeline.c). Any other name (the ASTC pool, whose caller decodes alongside it; movies; the log) keeps the default.
+static int qos_home(const char *name) {
+    static const char *const crit[] = {"main", "guest", "vk replay", "vk recorder", "vk present", "vk completion",
+                                       "vsync", "fg present", "audren", "pads", "motion", "window", NULL};
+    static const char *const bg[] = {"xlate", "shload", "shader ", "use preload", "pipe ", "big compute", "lib ",
+                                     "prewarm", "mesh fallback", "mem census", "flight dump", "vk headroom",
+                                     "debug names", NULL};
+    return !name || !*name ? QOS_HOME_NONE : name_is(name, crit) ? QOS_HOME_CRIT : name_is(name, bg) ? QOS_HOME_BG
+                                                                                                 : QOS_HOME_NONE;
+}
+
+static qos_class_t qos_of_home(int home) {
+    return home == QOS_HOME_CRIT ? QOS_CLASS_USER_INTERACTIVE : home == QOS_HOME_BG ? QOS_CLASS_UTILITY
+                                                                                     : QOS_CLASS_DEFAULT;
+}
+
+// A priority level as a class and relative priority. Above normal: interactive. Normal: the thread's home class when
+// that is interactive, else the default class, which is what normal priority was (a background worker raised to
+// normal while it holds a lock a frame waits on). Below normal and lowest: utility. Idle: background.
+static qos_class_t qos_of_prio(int prio, int home, int *rel) {
+    *rel = 0;
+    if (prio >= PLAT_PRIO_ABOVE_NORMAL) return QOS_CLASS_USER_INTERACTIVE;
+    if (prio == PLAT_PRIO_NORMAL) return home == QOS_HOME_CRIT ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_DEFAULT;
+    if (prio <= PLAT_PRIO_IDLE) return QOS_CLASS_BACKGROUND;
+    if (prio == PLAT_PRIO_LOWEST) *rel = -4;
+    return QOS_CLASS_UTILITY;
+}
 
 // A signal stack for the calling thread, so the fault and crash handlers still run when its own stack is exhausted.
 // Never freed: threads that end are few, and a stack freed while a handler might run on it would be worse.
@@ -92,6 +147,7 @@ static void alt_stack(void) {
 
 static void *thread_main(void *p) {
     PlatThread *t = p;
+    qos_self = t;
     alt_stack();
     if (t->name[0]) pthread_setname_np(t->name);
     t->fn(t->arg);
@@ -111,6 +167,10 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
     if (name) snprintf(t->name, sizeof t->name, "%s", name);
     pthread_attr_t a;
     pthread_attr_init(&a);
+    if (qos_on) {
+        t->home = qos_home(name);
+        pthread_attr_set_qos_class_np(&a, qos_of_home(t->home), 0);
+    }
     // The stack is mapped lazily, as Windows reserves it: only the pages a thread touches cost memory.
     pthread_attr_setstacksize(&a, stack ? stack : PLAT_STACK_DEFAULT);
     int e = pthread_create(&t->t, &a, thread_main, t);
@@ -130,6 +190,65 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     *first = 0;
     for (uint32_t i = 0; i < lg; i += per) *first |= 1ull << i;
     return (int)ph;
+}
+
+// ---- hardware profile
+// The GPU's core count is a property of its registry entry (the AGXAccelerator service), not in sysctl.
+static uint32_t gpu_core_count(void) {
+    uint32_t n = 0;
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(0, IOServiceMatching("AGXAccelerator"), &it) != KERN_SUCCESS) return 0;
+    for (io_object_t o; !n && (o = IOIteratorNext(it)); IOObjectRelease(o)) {
+        CFTypeRef v = IORegistryEntryCreateCFProperty(o, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+        if (!v) continue;
+        int32_t k = 0;
+        if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v, kCFNumberSInt32Type, &k) && k > 0) n = (uint32_t)k;
+        CFRelease(v);
+    }
+    IOObjectRelease(it);
+    return n;
+}
+
+static PlatHw hw;
+static PlatOnce hw_once = PLAT_ONCE_INIT;
+
+static void hw_read(void *arg) {
+    (void)arg;
+    size_t n = sizeof hw.chip;
+    if (sysctlbyname("machdep.cpu.brand_string", hw.chip, &n, NULL, 0)) snprintf(hw.chip, sizeof hw.chip, "unknown");
+    // "Apple M1", "Apple M1 Pro", "Apple M3 Max", "Apple M2 Ultra"
+    const char *m = strstr(hw.chip, "Apple M");
+    hw.tier = -1;
+    if (m && m[7] >= '1' && m[7] <= '9') {
+        hw.gen = (int)strtol(m + 7, NULL, 10);
+        hw.tier = strstr(m, " Ultra") ? 3 : strstr(m, " Max") ? 2 : strstr(m, " Pro") ? 1 : 0;
+    }
+    // Apple GPU families (Metal feature set tables): M1 Apple7, M2 Apple8, M3 and M4 Apple9, M5 Apple10, M6 Apple11.
+    static const int family[] = {0, 7, 8, 9, 9, 10, 11};
+    hw.metal_family = hw.gen > 0 && hw.gen < (int)(sizeof family / sizeof *family) ? family[hw.gen] : 0;
+    // hw.perflevel0 is the fastest kind of core; a chip with one kind has no perflevel1.
+    hw.pcores = sysctl_u32("hw.perflevel0.physicalcpu");
+    hw.ecores = sysctl_u32("hw.nperflevels") > 1 ? sysctl_u32("hw.perflevel1.physicalcpu") : 0;
+    if (!hw.pcores) hw.pcores = sysctl_u32("hw.physicalcpu");
+    hw.gpu_cores = gpu_core_count();
+    uint64_t mem = 0;
+    n = sizeof mem;
+    if (!sysctlbyname("hw.memsize", &mem, &n, NULL, 0)) hw.ram_mb = mem >> 20;
+}
+
+const PlatHw *plat_hw(void) {
+    plat_once(&hw_once, hw_read, NULL);
+    return &hw;
+}
+
+int plat_hw_text(char *out, size_t cap) {
+    const PlatHw *h = plat_hw();
+    static const char *const tiers[] = {"base", "Pro", "Max", "Ultra"};
+    int k = snprintf(out, cap, "%s: %s%d %s, GPU family Apple%d, %u performance + %u efficiency cores, %u GPU cores, "
+                     "%llu MiB of memory", h->chip, h->gen ? "M" : "generation ", h->gen,
+                     h->tier >= 0 ? tiers[h->tier] : "tier unknown", h->metal_family, h->pcores, h->ecores,
+                     h->gpu_cores, (unsigned long long)h->ram_mb);
+    return k < 0 ? 0 : (size_t)k < cap ? k : (int)cap - 1;
 }
 
 // One L3 cache at most, shared by every core.
@@ -387,7 +506,13 @@ int plat_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t stack
     return t != NULL;
 }
 
+static void qos_unboost(PlatThread *t) {
+    pthread_override_t o = __atomic_exchange_n(&t->boost, NULL, __ATOMIC_ACQ_REL);
+    if (o) pthread_override_qos_class_end_np(o);
+}
+
 void plat_thread_join(PlatThread *t) {
+    qos_unboost(t);
     pthread_join(t->t, NULL);
     free(t);
 }
@@ -400,6 +525,7 @@ int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
         if (now >= end) return 0;
         plat_wait_ns(end - now < 1000000u ? end - now : 1000000u);
     }
+    qos_unboost(t);
     pthread_join(t->t, NULL);
     free(t);
     return 1;
@@ -429,11 +555,54 @@ static void set_importance(pthread_t th, int prio) {
                       THREAD_PRECEDENCE_POLICY_COUNT);
 }
 
-void plat_thread_priority(int prio) { set_importance(pthread_self(), prio); }
+// With QoS on: the calling thread's own class; a raise another thread started on it ends, as the thread now says
+// for itself what it runs at.
+static void qos_set_self(int prio) {
+    PlatThread *t = qos_self;
+    int rel;
+    qos_class_t q = qos_of_prio(prio, t ? t->home : QOS_HOME_NONE, &rel);
+    pthread_set_qos_class_self_np(q, rel);
+    if (t) qos_unboost(t);
+}
 
-void plat_thread_set_priority(PlatThread *t, int prio) { set_importance(t->t, prio); }
+void plat_thread_priority(int prio) {
+    if (qos_on) qos_set_self(prio);
+    else set_importance(pthread_self(), prio);
+}
+
+// With QoS on, another thread's class cannot be set: a raise to normal or above starts an override of the class the
+// level maps to (one per thread; the callers repeat their raise while they wait), and a level below normal ends it.
+void plat_thread_set_priority(PlatThread *t, int prio) {
+    if (!qos_on) {
+        set_importance(t->t, prio);
+        return;
+    }
+    if (pthread_equal(t->t, pthread_self())) {
+        qos_set_self(prio);
+        return;
+    }
+    if (prio < PLAT_PRIO_NORMAL) {
+        qos_unboost(t);
+        return;
+    }
+    if (__atomic_load_n(&t->boost, __ATOMIC_ACQUIRE)) return;
+    int rel;
+    qos_class_t q = qos_of_prio(prio, t->home, &rel);
+    pthread_override_t o = pthread_override_qos_class_start_np(t->t, q, rel);
+    pthread_override_t none = NULL;
+    if (o && !__atomic_compare_exchange_n(&t->boost, &none, o, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        pthread_override_qos_class_end_np(o);   // another caller's raise got there first
+}
 
 int plat_thread_priority_get(void) {
+    if (qos_on) {
+        qos_class_t q = QOS_CLASS_UNSPECIFIED;
+        int rel = 0;
+        pthread_get_qos_class_np(pthread_self(), &q, &rel);
+        return q == QOS_CLASS_USER_INTERACTIVE ? PLAT_PRIO_HIGHEST : q == QOS_CLASS_USER_INITIATED ? PLAT_PRIO_ABOVE_NORMAL
+             : q == QOS_CLASS_UTILITY ? (rel < 0 ? PLAT_PRIO_LOWEST : PLAT_PRIO_BELOW_NORMAL)
+             : q == QOS_CLASS_BACKGROUND ? PLAT_PRIO_IDLE : PLAT_PRIO_NORMAL;
+    }
     thread_precedence_policy_data_t p = {0};
     mach_msg_type_number_t n = THREAD_PRECEDENCE_POLICY_COUNT;
     boolean_t def = 0;

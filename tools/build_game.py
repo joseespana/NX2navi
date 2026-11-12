@@ -164,7 +164,8 @@ elif MAC:
     # Apple's linker. @executable_path: a libSDL3 next to nx2navi comes before Homebrew's. -Xlinker passes the map path
     # as one argument, as on Windows. set_arch adds the architecture and Homebrew's directories.
     LINK_FLAGS = ["'-Wl,-rpath,@executable_path'", '-Xlinker', '-map', '-Xlinker', '"$builddir/nx2navi.map"']
-    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-lc++', '-framework', 'CoreFoundation']
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-lc++', '-framework', 'CoreFoundation',
+                 '-framework', 'IOKit']   # IOKit: the GPU core count (platform/darwin.c plat_hw)
     VMA_INCLUDE = Path('/opt/homebrew/include')   # vk_mem_alloc.h; Homebrew has no package of it, so it is fetched
 else:
     # -no-pie: the lifted modules' function tables (hundreds of thousands of pointers) need no load-time relocation.

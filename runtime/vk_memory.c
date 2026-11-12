@@ -823,15 +823,50 @@ void vk_mem_census(uint64_t frame) {
     window_start = frame;
 }
 
+#ifdef __APPLE__
+// macOS: the device-local budget on a Mac with little memory. The GPU shares the Mac's memory, and MoltenVK reports
+// Metal's recommended working set as the budget (heapBudget of VK_EXT_memory_budget; 25,559 MiB on a 32 GiB M1 Max,
+// 78%). Memory the GPU uses is wired: the kernel cannot page it out, and a 16 GiB Mac running this game ended in a
+// kernel panic in IOGPUGroupMemory at 14.7 GiB wired. On a Mac of MAC_SMALL_RAM_MB or less the decisions here and in
+// vk_texture.c (mirrors refused or evicted, released textures dropped) plan with at most half of its memory, which
+// leaves the rest for the game's own memory, macOS and its wired kernel memory. Half is an untested starting value: no
+// Mac of 16 GiB or less has run it. A larger Mac keeps the reported budget (measured on the 32 GiB M1 Max). The cap
+// steers only what can be dropped: with it simulated on the M1 Max (NX2NAVI_MAC_RAM_MB=16384, Kokiri Forest) device
+// use stayed at 9.5 GiB, about 5 GiB of it the guest's imported pools, and nothing was evicted; frame times unchanged.
+// NX2NAVI_MAC_RAM_MB (test): the memory size this choice takes in place of the Mac's own, so the decision can be seen
+// on a large Mac; it changes nothing else.
+#define MAC_SMALL_RAM_MB 16384
+static int64_t mac_budget_mb(uint64_t reported) {
+    const char *s = cfg_get("NX2NAVI_MAC_RAM_MB");
+    int64_t test = s && *s ? atoll(s) : 0;
+    uint64_t ram = test > 0 ? (uint64_t)test : plat_hw()->ram_mb;
+    int64_t cap = ram && ram <= MAC_SMALL_RAM_MB ? (int64_t)(ram / 2) : 0;
+    if (cap && reported && (uint64_t)cap >= reported >> 20) cap = 0;   // the driver's own figure is already lower
+    rt_log("mem: macOS with %llu MiB of memory%s: the device-local budget is %s %llu MiB%s",
+           (unsigned long long)ram, test > 0 ? " (NX2NAVI_MAC_RAM_MB, a test)" : "",
+           cap ? "taken as at most" : "the reported", (unsigned long long)(cap ? (uint64_t)cap : reported >> 20),
+           cap ? ", half of the memory (an untested starting value for Macs of 16 GiB or less)"
+               : ", Metal's recommended working set");
+    return cap;
+}
+#endif
+
 // NX2NAVI_VRAM_BUDGET_MB (test; unset or 0: the device's): the device-local budget every decision here and in
 // vk_texture.c compares with is at most this many MiB, so a large card behaves as a small one does under pressure
-// (mirrors refused or evicted, textures dropped). The heap lines still log what the driver reports.
-static uint64_t budget_cap(void) {
+// (mirrors refused or evicted, textures dropped). The heap lines still log what the driver reports. reported: the
+// driver's budget, for the macOS choice above.
+static uint64_t budget_cap(uint64_t reported) {
     static int64_t mb = -1;
     if (mb < 0) {
         const char *s = cfg_get("NX2NAVI_VRAM_BUDGET_MB");
         int64_t v = s && *s ? atoll(s) : 0;
         if (v > 0) rt_log("mem: the VRAM budget is taken as at most %lld MiB (NX2NAVI_VRAM_BUDGET_MB, a test)", (long long)v);
+#ifdef __APPLE__
+        else if (!reported) return 0;   // no device yet: decided at the first call that has the driver's figure
+        else v = mac_budget_mb(reported);
+#else
+        (void)reported;
+#endif
         mb = v > 0 ? v : 0;
     }
     return (uint64_t)mb << 20;
@@ -896,7 +931,7 @@ static int vram_query(uint64_t *used, uint64_t *budget, int *exact) {
 
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     int ok = vram_query(used, budget, exact);
-    uint64_t cap = budget_cap();
+    uint64_t cap = budget_cap(ok ? *budget : 0);
     if (ok && cap && *budget > cap) *budget = cap;
     return ok;
 }

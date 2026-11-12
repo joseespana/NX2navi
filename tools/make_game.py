@@ -155,7 +155,8 @@ if WIN:
     LINK_LIBS = ['-lvulkan-1', '-lSDL3', '-lopus', '-lvpx', '-l:libdav1d.a', '-lzstd', '-l:libatomic.a', '-lbcrypt', '-lws2_32',
                  '-limm32', '-luuid', '-lole32', '-luser32', '-lshell32', '-lgdi32', '-ladvapi32', '-lwinmm']
 elif MAC:   # tools/build_game.py's macOS libraries
-    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-framework', 'CoreFoundation']
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-framework', 'CoreFoundation',
+                 '-framework', 'IOKit']
 else:   # tools/build_game.py's Linux libraries, plus dav1d (the AV1 movies) and libatomic
     LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-l:libstdc++.a', '-latomic',
                  '-lm', '-lpthread', '-ldl']

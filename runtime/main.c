@@ -623,8 +623,20 @@ static void program_thread(void *arg) {
     plat_exit(code);
 }
 
+// NX2NAVI_THREAD_QOS (macOS; default 0, 1 on): threads get quality-of-service classes by their names instead of
+// precedence importance (platform/darwin.c plat_thread_qos), so macOS keeps the game's, rendering and audio threads on
+// the performance cores and the shader and pipeline workers off them. Set before the program thread starts, so every
+// thread the runtime makes has its class; the first thread, which becomes the window thread, is interactive too.
+// Off by default: in Kokiri Forest on an M1 Max (2026-11-12, four runs each, presents 3000-5400) it changed neither the
+// undisturbed frame time (32.7 ms both) nor the stretches of 40-47 ms frames (9 of 55 300-present blocks with it, 4 of
+// 45 without). A process started from a terminal gets its interactive threads at priority 37 (user-initiated), not 47.
+static int g_thread_qos;
+
 int main(int argc, char **argv) {
     mem_init();
+    g_thread_qos = rt_knob("THREAD_QOS", "0");
+    plat_thread_qos(g_thread_qos);
+    if (g_thread_qos) plat_thread_priority(PLAT_PRIO_ABOVE_NORMAL);
     g_main_args.argc = argc, g_main_args.argv = argv;
     if (!plat_thread_spawn(program_thread, NULL, "main", 0)) return program_main(argc, argv);
     gfx_window_main_thread();
@@ -639,6 +651,14 @@ int main(int argc, char **argv) {
     // The build that wrote the log, at its top: an attached log from another install or version shows at a glance.
     rt_log("version: NX2navi %s, game %d.%d.%d", rt_port_version, rt_game_version / 100, rt_game_version / 10 % 10,
            rt_game_version % 10);
+#ifdef __APPLE__
+    {   // the Mac's profile (platform/darwin.c plat_hw), which the per-Mac choices below and in vk_memory.c read
+        char hw[256];
+        plat_hw_text(hw, sizeof hw);
+        rt_log("mac: %s; threads by %s (NX2NAVI_THREAD_QOS)", hw,
+               g_thread_qos ? "quality-of-service class" : "precedence importance");
+    }
+#endif
     // A restart from the settings menu (gfx_present.c gfx_window_closed) starts this process while the one it replaces
     // is still exiting: its log, RomFS and saves are free once it is gone.
     if (plat_restart_wait(30000) < 0) rt_log("restart: the previous process still runs after 30 s; starting anyway");

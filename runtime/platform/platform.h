@@ -121,6 +121,25 @@ enum { PLAT_PRIO_IDLE = -15, PLAT_PRIO_LOWEST = -2, PLAT_PRIO_BELOW_NORMAL = -1,
 void plat_thread_priority(int prio);
 void plat_thread_set_priority(PlatThread *t, int prio);
 int plat_thread_priority_get(void);       // the calling thread's level
+#ifdef __APPLE__
+// The Mac the game runs on, read once from sysctl and the GPU's registry entry. gen is the M generation (1 for "Apple
+// M1 Max"), 0 for a chip not named "Apple M<n>"; tier 0 base, 1 Pro, 2 Max, 3 Ultra; metal_family the Apple GPU
+// family of that generation (7 for M1 ... 11 for M6), 0 unknown. Counts are 0 where the system does not say.
+typedef struct {
+    char chip[64];
+    int gen, tier, metal_family;
+    uint32_t pcores, ecores, gpu_cores;
+    uint64_t ram_mb;
+} PlatHw;
+const PlatHw *plat_hw(void);
+int plat_hw_text(char *out, size_t cap);  // the profile as one line of text; the characters written
+// Quality-of-service classes instead of precedence importance for the threads made from here on (on: 1). macOS keeps
+// threads of the higher classes on the performance cores and moves the lower ones to the efficiency cores. Each thread
+// gets a class from its name at creation (the game's, rendering, audio and present threads interactive; shader,
+// pipeline and other background work utility), and plat_thread_priority / plat_thread_set_priority map the levels to
+// classes. Call before the threads it should cover are started. Off: precedence importance as before.
+void plat_thread_qos(int on);
+#endif
 void plat_yield(void);                    // gives the rest of the time slice to another ready thread
 static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)
