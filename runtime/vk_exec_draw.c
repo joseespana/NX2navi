@@ -677,7 +677,7 @@ static int texel_bytes(VkFormat f) {
     }
 }
 
-// Images written this frame through an integer storage view (storage_view_format), in the order of their writes (seq):
+// Images written this frame through a view of another format (get_view), in the order of their writes (seq):
 // Ocarina's last post-process pass stores shared-exponent RGB9E5 texels that way into its R11G11B10F scene target, raw
 // words the upscaler that reads them (tensor-core, untranslatable) decodes itself, and the fallback blit must too
 // (raw_9e5). Now and then (1 of 529 frames sampled in a field) the same pass writes them into the RGB9E5 image at that
@@ -728,18 +728,6 @@ static VkFormat descriptor_view_format(const VkTexImage *img, const view_t *v, i
     if (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT && hv && v->set_format && tex_vk_format(v->format, &f) &&
         texel_bytes(f.vk) && texel_bytes(f.vk) == texel_bytes(img->format))
         return f.vk;
-    return img->format;
-}
-
-// The format a storage view of img takes: the view's integer format when it sets one of the image's texel size (the
-// image is MUTABLE_FORMAT, vk_texture.c), else the image's own.
-static VkFormat storage_view_format(const VkTexImage *img, const view_t *v, int hv) {
-    VkFormat f;
-    if (hv && v->set_format && int_view_format(v->format, &f) && texel_bytes(f) && texel_bytes(f) == texel_bytes(img->format)) {
-        if (img->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || img->format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)
-            raw_note(img->image);
-        return f;
-    }
     return img->format;
 }
 
@@ -6054,7 +6042,7 @@ static int aa_dispatch(VkExec *ex, int x, int y, int z) {
             t->type != VK_IMAGE_TYPE_2D || t->samples != 1)
             continue;
         dst = t;
-        if (storage_view_format(t, &v, hv) == VK_FORMAT_R32_UINT) dv = get_view(ex, t, &v, hv, 3, 1);   // 3: Texture2D
+        if (descriptor_view_format(t, &v, hv) == VK_FORMAT_R32_UINT) dv = get_view(ex, t, &v, hv, 3, 1);   // 3: Texture2D
     }
     for (int i = 0; dst && i < 128 && !src; i++) {   // the composite: R11G11B10F of the same size, another image
         uint64_t h = ex->tex[NVN_STAGE_CS][i];
