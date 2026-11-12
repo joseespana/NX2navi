@@ -1450,6 +1450,7 @@ void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) {
 
 void plat_crash_context(const char *s) { (void)s; }   // the Windows crash notes only
 int plat_crash_filter_reassert(char *who, size_t n) { (void)who, (void)n; return 0; }   // Windows only
+const char *plat_crash_context_get(void) { return NULL; }
 
 // plat_jmp_save / plat_jmp_go (platform.h): leaf code that does not move the stack pointer before it leaves.
 #if defined(__x86_64__)

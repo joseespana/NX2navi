@@ -865,6 +865,7 @@ void vk_exec_pass_begin(VkExec *ex) {
         m->step = ex->mark_passes++;
         m->w = ex->pass_w, m->h = ex->pass_h, m->d = ex->pass_layers;
         m->layer = ex->depth.image ? ex->depth.base_layer : 0;
+        m->vw = m->vh = 0;
         m->ncolor = (uint8_t)(ex->pass_ncolor < 8 ? ex->pass_ncolor : 8);
         for (int i = 0; i < m->ncolor; i++) m->color[i] = ex->pass_color[i];
         m->depth = ex->pass_depth ? ex->pass_depth : ex->pass_stencil;
@@ -904,18 +905,27 @@ void vk_exec_pass_end(VkExec *ex) {
             bc_copy_back(ex, &ex->color[i]);
     if (vk_dump_armed) vk_dump_pass_end(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    // The targets are marked written outside tfr_lock: vk_texture_gpu_written takes the texture lock, and a chunk that
+    // holds the texture lock can end its pass here (a lookup's alias copy, vk_exec_inline_begin) and then wait for
+    // tfr_lock. Taken the other way round, a chunk holding tfr_lock and waiting for the texture lock deadlocked with it,
+    // the other chunks spinning in their turns (the loading screen after Continue, 3 replay workers). tfr_lock guards
+    // only the target history and takes no other lock inside.
+    for (int i = 0; i < 8; i++)
+        if (ex->color[i].image) vk_texture_gpu_written(ex->color[i].tex);
+    if (ex->depth.image) vk_texture_gpu_written(ex->depth.tex);
     int lk = vk_exec_shared();
     if (lk) plat_mutex_lock(&tfr_lock);
     for (int i = 0; i < 8; i++)
         if (ex->color[i].image) {
             TfrTarget ft = tfr_of(&ex->color[i]);
-            vk_texture_gpu_written(ex->color[i].tex), tfr_note(&ft, stamp);
+            tfr_note(&ft, stamp);
         }
     if (ex->depth.image) {
         TfrTarget ft = tfr_of(&ex->depth);
-        vk_texture_gpu_written(ex->depth.tex), tfr_note(&ft, stamp);
+        tfr_note(&ft, stamp);
     }
     if (lk) plat_mutex_unlock(&tfr_lock);
+    vk_dlaa_pass_end(ex);   // a jittered pass left its targets' outer rows or columns undrawn
 }
 
 VkCommandBuffer vk_exec_inline_begin(int *reopen) {
@@ -1115,7 +1125,19 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 // command, it was 4% of the replay in Kokiri Forest.
 static int split_n = -1, split_idle, split_in_pass, split_draws, split_at, part_start;
 static uint64_t split_ns, part_t0;
-static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits;
+static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
+
+int vk_exec_split_now(VkExec *ex) {
+    int in_pass = ex->in_pass;
+    if (in_pass) vk_exec_pass_end(ex);
+    VkCommandBuffer cb = vk_sync_cut();   // not handed to the queue: the texture pool set stays (vk_exec_pool_split)
+    if (!cb) return 0;
+    ex->cb = cb;
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    vk_exec_draw_new_cb();
+    n_cuts++;
+    return 1;
+}
 
 static int split_wanted(void) {
     if (split_draws >= split_at) return 1;
@@ -1765,10 +1787,13 @@ static void op_one(VkExec *ex, const op_hdr *h) {
     }
 }
 
-// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 3; 0: the replay records every op on the submitting thread)
-// Default 3: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
+// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 0: the replay records every op on the submitting thread; the
+// Game tab's Replay workers row sets it)
+// 3 workers: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
 // batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
-// Valley; 5 or 7 workers measured the same as 3.
+// Valley; 5 or 7 workers measured the same as 3. Default 0 again after players' games crashed with 3 on by default
+// (0.9.1, 0.9.2): an RX 6700 XT lost its device after about 18,000 frames, its last mark a compute dispatch of the
+// replay's own, with an occlusion query slot found unavailable after its fence just before; the cause is not known.
 // A submission's draws come in runs between ops that have to stay in the replay's order on its own thread (dispatches,
 // copies, texture and buffer clears, events, the game's barriers, calls). Hyrule Field, standing (NX2NAVI_REPLAY_RUNS,
 // 2026-11-11): about 3,500 draws a frame in 82 runs, 96% of them in runs of 16 draws or more and 67% in runs of 256 or
@@ -2086,9 +2111,10 @@ static uint32_t group_peek(const VkExec *ex, const op_hdr *h, const op_hdr **end
     int begun = 0;
     const p_set_rt *rt = &ex->rt;
     *why = GE_LIMIT;
-    // mesh draws stay on the submitting thread with the mesh fallback (its buffers are shared) and while
-    // NX2NAVI_GPU_PASSES copies their workgroup counts (one list)
-    int mesh_serial = vk_ctx()->mesh_fallback || vk_gpu_passes_capturing();
+    // mesh draws stay on the submitting thread with the mesh fallback (its buffers are shared), with the mesh emulation
+    // (no VK_EXT_mesh_shader: its arena, queue and the part's pre-pass command buffer are the submitting thread's) and
+    // while NX2NAVI_GPU_PASSES copies their workgroup counts (one list)
+    int mesh_serial = vk_ctx()->mesh_fallback || !vk_ctx()->has_mesh_shader || vk_gpu_passes_capturing();
     for (uint32_t ops = 0; ops < GROUP_PEEK; ops++) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) { *why = GE_RUN; break; }   // the walk reports it
         const void *a = nvn_op_payload(h);
@@ -2445,10 +2471,15 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
 // scheduler prefers it over the guest's other cores (NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone) and
 // gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's cores, the audio, the
 // shader and pipeline workers, is kept off it, so nothing of this process preempts the recording. That core is then
-// lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only with 12 or more logical processors,
-// and not while the process runs on the die with the largest L3 alone (perf.c cpu_placement): on a two-die X3D part
-// the game's threads already have that die to themselves, and a core taken from them cost frames; 1 always, 0 never.
-// Linux reserves none with fewer than four fast cores.
+// lost to the rest, so NX2NAVI_RECORDER_CORE=auto reserves it only with 12 or more logical processors, and not while
+// the process runs on the die with the largest L3 alone (perf.c cpu_placement): on a two-die X3D part the game's
+// threads already have that die to themselves, and a core taken from them cost frames; 1 always, 0 never. Linux
+// reserves none with fewer than four fast cores.
+// 0 is the default: on an i9-14900KF (8 performance and 16 efficiency cores, 32 logical processors) with the replay on
+// its own thread, the reserved core (logical processors 14 and 15) left the woken replay thread unscheduled for about
+// 200 ms roughly once a second while the game stood in Kakariko: its queue held 40 to 50 items, its lock was free, the
+// wakes had been sent and it used no CPU time, while the game waited on a fence of the work in that queue (27 frames a
+// minute with a 150 ms or longer frame). With no core reserved the same minute had none.
 // The recording thread is not the first to call vk_exec_record: the game's main thread submits first and goes on
 // submitting a little at a time, while another guest thread does the work (Kokiri Forest: that thread spent 21.9 of
 // the 22.5 s the replay took in a minute and a half, the first one 0.5 s). The first thread to have spent
@@ -2479,6 +2510,8 @@ static void rec_claim(void) {
                       "NX2NAVI_RECORDER_CORE=0 turns it off)", n > 1 ? "s" : "", which, n, ncpu);
         else rt_log("vk: no core was reserved for the recording thread (too few fast cores, or the system refused it; "
                     "NX2NAVI_RECORDER_CORE=0 stops the attempt)");
+    } else {
+        rt_log("vk: the recording thread runs on any core (NX2NAVI_RECORDER_CORE=auto or 1 reserves one)");
     }
 }
 
@@ -2576,10 +2609,10 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     if (n) n_subs++;
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f (%.2f first parts sent while the GPU was idle, %.2f "
-               "splits inside a pass); event order: held %llu, resumed %llu (%llu without their signal), switches %llu, "
+               "splits inside a pass, %.2f cuts for emulated mesh stages); event order: held %llu, resumed %llu (%llu without their signal), switches %llu, "
                "held now %d; waits a CPU signal met only after the submission's copies were taken: %llu",
                (double)(n_subs + n_parts) / (double)n_subs, (double)n_idle_parts / (double)n_subs,
-               (double)n_pass_splits / (double)n_subs, (unsigned long long)evo_held, (unsigned long long)evo_resumed,
+               (double)n_pass_splits / (double)n_subs, (double)n_cuts / (double)n_subs, (unsigned long long)evo_held, (unsigned long long)evo_resumed,
                (unsigned long long)evo_forced, (unsigned long long)evo_switches, evo_pending,
                (unsigned long long)vk_exec_event_late_take());
         uint64_t xw, xe, xl, xm, le, lc, lo;
@@ -2671,7 +2704,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         }
         RW.groups = RW.group_draws = RW.chunks = RW.serial_draws = RW.wait_ns = 0;
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
-        n_subs = n_parts = n_idle_parts = n_pass_splits = 0;
+        n_subs = n_parts = n_idle_parts = n_pass_splits = n_cuts = 0;
     }
     rec_spent_ns += kern_now_ns() - in_ns;
     if (rec_spent_ns >= REC_CLAIM_NS) rec_claim();
