@@ -85,7 +85,7 @@ int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
     return vk_caps.gpl;
 }
 
-// The guest adds floats in storage buffers with RED/ATOM .F32 (tools/xlate/patches/0041): one OpAtomicFAddEXT where the
+// The guest adds floats in storage buffers with RED/ATOM .F32 (tools/xlate/patches/0042): one OpAtomicFAddEXT where the
 // device has shaderBufferFloat32AtomicAdd, else the compare-and-swap loop of patches 0023 and 0033. Of the extension's
 // features only that one stays on: it is the one the translator uses. vk_device.c asks for the extension only while
 // NX2NAVI_VK_FLOAT_ATOMICS is on, so 0 keeps the loop and leaves the extension off as well.

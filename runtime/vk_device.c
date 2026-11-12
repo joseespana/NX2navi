@@ -91,14 +91,19 @@ static int instance_ext_present(const char *name) {
 // Mesa's drivers (RADV on Linux and the Steam Deck) keep a shader cache of their own beside our pipeline cache, by
 // default in ~/.cache and up to 1 GB: about 35 MB in a minute of the title screen. A Deck's /home is small and the game
 // usually sits on the SD card, so unless MESA_SHADER_CACHE_DIR names a folder, it goes to mesa-cache beside the exe.
+// That folder is ours alone, so its limit is raised to MESA_CACHE_SIZE unless MESA_SHADER_CACHE_MAX_SIZE is set: the
+// stage libraries the library warm builds in play live only in the driver's cache (vk_pipeline.c, "the play cache"),
+// and a preparation of every shader variant does not fit in 1 GB, so the rest would be compiled again in play.
+#define MESA_CACHE_SIZE "8G"
 static void mesa_cache_beside_exe(void) {
-    char dir[PLAT_PATH_MAX * 2];
+    char dir[PLAT_PATH_MAX * 2], size[32];
     if (plat_getenv("MESA_SHADER_CACHE_DIR", dir, sizeof dir)) return;
     int len = plat_exe_path(dir, sizeof dir - 16);
     char *cut = len ? plat_last_sep(dir) : NULL;
     if (!cut) return;
     strcpy(cut + 1, "mesa-cache");
     plat_setenv("MESA_SHADER_CACHE_DIR", dir);
+    if (!plat_getenv("MESA_SHADER_CACHE_MAX_SIZE", size, sizeof size)) plat_setenv("MESA_SHADER_CACHE_MAX_SIZE", MESA_CACHE_SIZE);
 }
 
 #ifdef __APPLE__
@@ -427,7 +432,7 @@ static int create_device(void) {
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
-    // Float adds in storage buffers as one atomic (translator patch 0041, vk_caps.c vk_caps_float_atomics).
+    // Float adds in storage buffers as one atomic (translator patch 0042, vk_caps.c vk_caps_float_atomics).
     // NX2NAVI_VK_FLOAT_ATOMICS=0 leaves the extension off, not only its feature.
     int has_saf = 0;
     if (cfg_bool("NX2NAVI_VK_FLOAT_ATOMICS") && has_ext(ep, ne, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
@@ -608,6 +613,7 @@ static int create_device(void) {
                                  .preferredLargeHeapBlockSize = vk_vma_block_size(),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }
+    vk_mem_ballast(g_vk.vma);
 
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
                                     .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0};
@@ -632,6 +638,7 @@ static void destroy_all(void) {
     if (lost_fence) vkDestroyFence(g_vk.device, lost_fence, NULL);   // vk_device_lost_poll
     lost_fence = VK_NULL_HANDLE;
     vk_headroom_stop();
+    if (g_vk.vma) vk_mem_ballast_release(g_vk.vma);
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
     if (g_vk.device) vkDestroyDevice(g_vk.device, NULL);
     if (g_vk.messenger) {

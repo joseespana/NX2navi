@@ -218,7 +218,7 @@
                      case Instruction.AtomicAdd | Instruction.FP32:
 -                        // NX2NAVI: the word is read, the float sum swapped in if the word is still the one read,
 -                        // and the loop repeats otherwise (InstEmitMemory EmitAtomicOp marks these)
--                        resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
+-                        resultValue = GenerateAtomicCasLoop(context, resourceManager, wordOffset, binding, (memValue) =>
 +                        if (nativeFloatAtomicAdd)
                          {
 -                            return context.FPAdd(memValue, value);
@@ -237,7 +237,7 @@
 +                        {
 +                            // NX2NAVI: the word is read, the float sum swapped in if the word is still the one read,
 +                            // and the loop repeats otherwise (InstEmitMemory EmitAtomicOp marks these)
-+                            resultValue = GenerateAtomicCasLoop(context, wordOffset, binding, (memValue) =>
++                            resultValue = GenerateAtomicCasLoop(context, resourceManager, wordOffset, binding, (memValue) =>
 +                            {
 +                                return context.FPAdd(memValue, value);
 +                            });

@@ -136,7 +136,7 @@ static class SwshXlate
         // global accesses the translator finds no storage buffer for go through it (patch 0030).
         public bool QueryHostSupportsBufferDeviceAddress() => _job["bda"] is JsonValue v && v.TryGetValue<bool>(out bool b) && b;
         // "float_atomic_add": true: the device adds floats in storage buffers atomically (VK_EXT_shader_atomic_float,
-        // runtime/vk_device.c): a float atomic add (RED/ATOM .F32.FTZ.RN) stays one OpAtomicFAddEXT (patch 0041) instead of
+        // runtime/vk_device.c): a float atomic add (RED/ATOM .F32.FTZ.RN) stays one OpAtomicFAddEXT (patch 0042) instead of
         // the compare-and-swap loop of patches 0023 and 0033.
         public bool QueryHostSupportsFloat32AtomicAdd() => _job["float_atomic_add"] is JsonValue v && v.TryGetValue<bool>(out bool b) && b;
         public bool QueryHostSupportsTextureShadowLod() => true;
@@ -207,8 +207,13 @@ static class SwshXlate
                     }
                     else
                     {
-                        code = AmpereLowering.Lower(code, size, (string)job["stage"] != "cs", out int local, table);
+                        // A compute program's own local memory: "local_mem" from its control section, at least the
+                        // translator's default of 0x1000 bytes; the lowering's spill area goes after it.
+                        bool cs = (string)job["stage"] == "cs";
+                        int own = cs ? (Math.Max(job["local_mem"] is JsonNode lm ? (int)lm : 0, 0x1000) + 15) & ~15 : 0;
+                        code = AmpereLowering.Lower(code, size, !cs, out int local, table, null, own);
                         if (local != 0) job["local_mem"] = local;
+                        else if (cs) job["local_mem"] = own;
                     }
                     if (job["lowered_out"] is JsonNode lo) File.WriteAllBytes((string)lo, code);
                 }
