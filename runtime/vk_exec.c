@@ -746,8 +746,29 @@ static void attachment_barrier(VkExec *ex) {
     ex->recorded++;
 }
 
+#ifdef __APPLE__
+// Whole-target clears held for the next pass (vk_exec_pass_begin, pass_clear_hold)
+#define PC_MAX 9
+typedef struct {
+    VkImage image;
+    VkImageAspectFlags aspect;   // colour, or the depth and stencil aspects cleared
+    uint32_t level, base, layers, w, h;
+    VkClearValue v;
+} PassClear;
+static struct {
+    int n;
+    PassClear e[PC_MAX];
+    uint64_t folded, recorded;   // NX2NAVI_TRACE=perf (vk_exec_barrier_log)
+} PC;
+static void pass_clears_flush(VkExec *ex);
+static int rw_workers(void);
+#endif
+
 static void barrier_to_why(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant, int why) {
     vk_exec_pass_end(ex);
+#ifdef __APPLE__
+    pass_clears_flush(ex);   // a held whole-target clear goes before whatever this barrier orders
+#endif
     if (why == BR_OTHER) ex->bar_dirty = 1;   // also when it falls together with the last one: its commands follow
     VkImageMemoryBarrier2 ib[18];
     uint32_t n = 0;
@@ -807,7 +828,106 @@ void vk_exec_barrier_log(uint64_t frame) {
         bstat[k] = 0;
     }
     rt_log("vk_exec: frame %llu: barriers per frame: %s", (unsigned long long)frame, s);
+#ifdef __APPLE__
+    rt_log("vk_exec: whole-target clears per frame: %.1f begun with their pass, %.1f recorded alone", PC.folded / f,
+           PC.recorded / f);
+    PC.folded = PC.recorded = 0;
+#endif
 }
+
+#ifdef __APPLE__
+// ---- whole-target clears folded into the next pass (macOS)
+// On Apple GPUs a pass's attachments live in tile memory: a pass that loads a target reads all of it from memory first,
+// and a vkCmdClear*Image outside a pass is a Metal pass of its own that writes all of it out. The game clears its
+// targets right before it draws into them, so a whole-target clear outside a pass (clear_color, clear_ds) is held
+// here, and when the next pass attaches that same subresource over its whole area, the pass begins with
+// VK_ATTACHMENT_LOAD_OP_CLEAR instead: Metal clears the tiles, with no pass of its own and no load.
+// A held clear is recorded as before (a full barrier, then vkCmdClear*Image) at anything else that could see the image:
+// any barrier (copies, dispatches, the replay's inline commands), any op other than state, binds, draws, render
+// conditions and counter reports (op_one), a command buffer part split, and the end of the submission. Held only
+// on the submitting thread without replay workers (their chunks copy the replay state), not while a frame dump is
+// armed, nor while DLAA or contact shadows run: their pass hooks record outside the pass before it begins
+// (vk_exec_pass_begin) and could read the target. NX2NAVI_PASS_CLEAR=0 records every clear at once.
+
+static int pass_clear_on(const VkExec *ex) {
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("PASS_CLEAR", "1");
+        if (on) rt_log("vk_exec: whole-target clears begin the next pass on that target (NX2NAVI_PASS_CLEAR)");
+    }
+    return on && ex == &X && !rw_chunk && !rw_workers() && !vk_dump_armed && !vk_dlaa_wanted() && !vk_contact_strength();
+}
+
+static void pass_clear_record(VkExec *ex, int i) {
+    VkImageSubresourceRange r = {PC.e[i].aspect, PC.e[i].level, 1, PC.e[i].base, PC.e[i].layers};
+    vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)PC.e[i].w * PC.e[i].h);
+    if (PC.e[i].aspect & VK_IMAGE_ASPECT_COLOR_BIT)
+        vkCmdClearColorImage(ex->cb, PC.e[i].image, VK_IMAGE_LAYOUT_GENERAL, &PC.e[i].v.color, 1, &r);
+    else
+        vkCmdClearDepthStencilImage(ex->cb, PC.e[i].image, VK_IMAGE_LAYOUT_GENERAL, &PC.e[i].v.depthStencil, 1, &r);
+    ex->recorded++;
+    PC.recorded++;
+}
+
+// Records the held clears in their order, each behind a full barrier as clear_color and clear_ds did.
+static void pass_clears_flush(VkExec *ex) {
+    if (!PC.n || ex != &X) return;
+    int n = PC.n;
+    PC.n = 0;   // barrier_to below comes back here
+    for (int i = 0; i < n; i++) {
+        barrier_to(ex, NULL, NULL, 0);
+        pass_clear_record(ex, i);
+    }
+}
+
+// clear_color, clear_ds: 1 when the clear is held for the next pass.
+static int pass_clear_hold(VkExec *ex, const VkExecTarget *t, VkImageAspectFlags aspect, const VkClearValue *v) {
+    if (!pass_clear_on(ex)) return 0;
+    for (int i = 0; i < PC.n; i++)   // a second clear of the same image: the first goes now, in order
+        if (PC.e[i].image == t->image) {
+            pass_clears_flush(ex);
+            break;
+        }
+    if (PC.n == PC_MAX) pass_clears_flush(ex);
+    PC.e[PC.n++] = (PassClear){t->image, aspect, t->level, t->base_layer, t->layers, t->width, t->height, *v};
+    ex->recorded++;   // counts as recorded: the submission's end barrier (vk_exec_submit) records it
+    vk_texture_gpu_written(t->tex);
+    return 1;
+}
+
+// Ops that leave a held clear held: they record nothing that reads or writes an image outside a pass.
+static int pass_clear_keeps(uint32_t op) {
+    switch (op) {
+    case OP_BEGIN: case OP_SET_RT: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_VIEWPORTS: case OP_SCISSOR:
+    case OP_DEPTH_RANGE: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_DEPTH_CLAMP:
+    case OP_RASTER_DISCARD: case OP_PRIM_RESTART: case OP_COPY_STRIDE: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
+    case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+    case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_PUSH_CC:
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
+    case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
+        return 1;
+    default: return 0;
+    }
+}
+
+// vk_exec_pass_begin: takes the held clear of attachment t out of the list when the attachment is the clear's
+// subresource, the pass covers all of it, and the pass attaches every aspect it clears (cover); returns those aspects
+// and the value in *v, or 0.
+static VkImageAspectFlags pass_clear_take(VkExec *ex, const VkExecTarget *t, VkImageAspectFlags cover, VkClearValue *v) {
+    for (int i = 0; i < PC.n; i++) {
+        if (PC.e[i].image != t->image) continue;
+        VkImageAspectFlags a = PC.e[i].aspect;
+        if (PC.e[i].level != t->level || PC.e[i].base != t->base_layer || PC.e[i].layers != t->layers ||
+            PC.e[i].w != ex->pass_w || PC.e[i].h != ex->pass_h || t->layers != ex->pass_layers || (a & ~cover))
+            return 0;
+        *v = PC.e[i].v;
+        PC.e[i] = PC.e[--PC.n];   // the others are of other images: their order does not matter
+        PC.folded++;
+        return a;
+    }
+    return 0;
+}
+#endif
 
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
@@ -834,6 +954,23 @@ void vk_exec_pass_begin(VkExec *ex) {
         if (has_image(want, nwant, t->image)) continue;
         want[nwant] = t->image, wasp[nwant++] = i < 8 ? VK_IMAGE_ASPECT_COLOR_BIT : t->img->aspect;
     }
+#ifdef __APPLE__
+    VkClearValue pcv[9];
+    VkImageAspectFlags pca[9] = {0};
+    if (PC.n) {   // held clears of this pass's attachments become its load op; barrier_to_why records the others
+        int folded = 0;
+        for (uint32_t i = 0; i < 9; i++) {
+            const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+            if ((i < 8 && i >= ex->pass_ncolor) || !t->image || (fbl >> i & 1)) continue;
+            VkImageAspectFlags cover =
+                i < 8 ? VK_IMAGE_ASPECT_COLOR_BIT
+                      : (ex->pass_depth ? t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                            (ex->pass_stencil ? t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+            if ((pca[i] = pass_clear_take(ex, t, cover, &pcv[i]))) folded = 1;
+        }
+        if (folded) ex->bar_dirty = 1;   // a full barrier: the clear orders after earlier work on the image, as its own did
+    }
+#endif
     barrier_to_why(ex, want, wasp, nwant, BR_PASS);   // passes, clears, copies and dispatches see each other's results
     ex->bar_passes++;
     ex->fbl_mask = fbl;
@@ -848,7 +985,11 @@ void vk_exec_pass_begin(VkExec *ex) {
         ca[i].imageView = view_of(ex, t);
         ca[i].imageLayout = fbl >> i & 1 ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL;
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;    }
+        ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+#ifdef __APPLE__
+        if (pca[i]) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca[i].clearValue = pcv[i];
+#endif
+    }
     const VkExecTarget *d = &ex->depth;
     if (d->image) {
         VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view_of(ex, d),
@@ -857,6 +998,10 @@ void vk_exec_pass_begin(VkExec *ex) {
                                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
         if (d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) da = a;
         if (d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) sa = a;
+#ifdef __APPLE__
+        if (pca[8] & VK_IMAGE_ASPECT_DEPTH_BIT) da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.clearValue = pcv[8];
+        if (pca[8] & VK_IMAGE_ASPECT_STENCIL_BIT) sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, sa.clearValue = pcv[8];
+#endif
     }
     // The start mark goes between the barrier and vkCmdBeginRendering, its end right after vkCmdEndRendering
     // (vk_exec_pass_end): outside the pass, and without breaking it.
@@ -1045,6 +1190,9 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
     VkClearColorValue cv;
     memcpy(cv.float32, c->rgba, sizeof cv.float32);   // integer targets: the payload's bits as the front end stored them
     if (whole_target(ex, t)) {
+#ifdef __APPLE__
+        if (pass_clear_hold(ex, t, VK_IMAGE_ASPECT_COLOR_BIT, &(VkClearValue){.color = cv})) return;
+#endif
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};
         vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
@@ -1077,6 +1225,9 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
     float d = c->depth < 0.0f ? 0.0f : c->depth > 1.0f ? 1.0f : c->depth;
     VkClearDepthStencilValue v = {d, (uint32_t)c->stencil & 0xff};
     if (whole_target(ex, t)) {
+#ifdef __APPLE__
+        if (pass_clear_hold(ex, t, asp, &(VkClearValue){.depthStencil = v})) return;
+#endif
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
         vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
@@ -1130,6 +1281,9 @@ static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 int vk_exec_split_now(VkExec *ex) {
     int in_pass = ex->in_pass;
     if (in_pass) vk_exec_pass_end(ex);
+#ifdef __APPLE__
+    pass_clears_flush(ex);
+#endif
     VkCommandBuffer cb = vk_sync_cut();   // not handed to the queue: the texture pool set stays (vk_exec_pool_split)
     if (!cb) return 0;
     ex->cb = cb;
@@ -1178,6 +1332,9 @@ static void maybe_split(VkExec *ex) {
     if (ex->recorded == part_start || !vk_exec_pool_split(ex->fence)) return;
     if (idle) n_idle_parts++;
     if (ex->in_pass) vk_exec_pass_end(ex), n_pass_splits++;   // the next draw begins the pass again, in the new part
+#ifdef __APPLE__
+    pass_clears_flush(ex);
+#endif
     ex->cb = vk_sync_split();
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
@@ -1716,6 +1873,9 @@ int vk_exec_mesh_run(const void *cur, const void **out, int max) {
 // One op of the stream other than those that steer the walk (END, JUMP, CALL and WAIT_EVENT: walk).
 static void op_one(VkExec *ex, const op_hdr *h) {
     const void *a = nvn_op_payload(h);
+#ifdef __APPLE__
+    if (PC.n && !pass_clear_keeps(h->op)) pass_clears_flush(ex);
+#endif
     switch (h->op) {
     case OP_BEGIN: break;
     case OP_SET_RT: set_rt(ex, a); break;
@@ -1896,6 +2056,9 @@ static struct {
     uint64_t pw_n[PW_N], pw_ns[PW_N], behind_ns, pd_op[OP_COUNT_];
     volatile uint64_t turns, turn_ns, redos, chunk_ns;   // chunk_ns: the chunks' recording, every thread's
 } RW = {.n = -1};
+#ifdef __APPLE__
+static int rw_workers(void) { return RW.n != 0; }   // -1 before rw_init: not known yet, so nothing is held
+#endif
 
 static void group_take(int pool);
 
@@ -2382,6 +2545,9 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     __atomic_store_n(&g->seq, ++Q.out, __ATOMIC_RELEASE);
     // the replay's command buffer so far goes into the part, then the chunks' places, and the replay goes on in a new
     // one at once
+#ifdef __APPLE__
+    pass_clears_flush(ex);
+#endif
     ex->cb = vk_sync_append_later(nc, &g->at);
     for (int i = 0; i < nc; i++) Q.q[(Q.put + (uint64_t)i) % QN] = &g->c[i];
     uint64_t tf = kern_now_ns();
