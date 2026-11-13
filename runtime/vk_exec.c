@@ -760,6 +760,10 @@ static struct {
     PassClear e[PC_MAX];
     uint64_t folded, recorded;   // NX2NAVI_TRACE=perf (vk_exec_barrier_log)
 } PC;
+// Set while op_one runs an op whose barriers order only buffer work (OP_BARRIER, OP_UPDATE_UB): held clears stay held
+// past them. Their image writes then happen later, inside the next pass on the image or where pass_clears_flush
+// records them, each behind a full barrier of its own.
+static int pc_bar_keeps;
 static void pass_clears_flush(VkExec *ex);
 static int rw_workers(void);
 #endif
@@ -767,7 +771,7 @@ static int rw_workers(void);
 static void barrier_to_why(VkExec *ex, const VkImage *want, const VkImageAspectFlags *wasp, int nwant, int why) {
     vk_exec_pass_end(ex);
 #ifdef __APPLE__
-    pass_clears_flush(ex);   // a held whole-target clear goes before whatever this barrier orders
+    if (!pc_bar_keeps) pass_clears_flush(ex);   // a held whole-target clear goes before whatever this barrier orders
 #endif
     if (why == BR_OTHER) ex->bar_dirty = 1;   // also when it falls together with the last one: its commands follow
     VkImageMemoryBarrier2 ib[18];
@@ -843,8 +847,11 @@ void vk_exec_barrier_log(uint64_t frame) {
 // here, and when the next pass attaches that same subresource over its whole area, the pass begins with
 // VK_ATTACHMENT_LOAD_OP_CLEAR instead: Metal clears the tiles, with no pass of its own and no load.
 // A held clear is recorded as before (a full barrier, then vkCmdClear*Image) at anything else that could see the image:
-// any barrier (copies, dispatches, the replay's inline commands), any op other than state, binds, draws, render
-// conditions and counter reports (op_one), a command buffer part split, and the end of the submission. Held only
+// any barrier (copies, dispatches, the replay's inline commands) other than the game's own and a uniform update's,
+// any op other than state, binds, draws, render conditions, counter reports, the game's barriers and uniform updates
+// (op_one), a command buffer part split, and the end of the submission. Kokiri Forest: about 39 whole-target clears a
+// frame begin their pass and 11 are recorded alone (before a dispatch, a texture copy, an event signal, or a pass on
+// other targets). Held only
 // on the submitting thread without replay workers (their chunks copy the replay state), not while a frame dump is
 // armed, nor while DLAA or contact shadows run: their pass hooks record outside the pass before it begins
 // (vk_exec_pass_begin) and could read the target. NX2NAVI_PASS_CLEAR=0 records every clear at once.
@@ -905,6 +912,7 @@ static int pass_clear_keeps(uint32_t op) {
     case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_PUSH_CC:
     case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
     case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
+    case OP_BARRIER: case OP_UPDATE_UB:   // a barrier, and a barrier and a buffer copy (pc_bar_keeps)
         return 1;
     default: return 0;
     }
@@ -1875,6 +1883,7 @@ static void op_one(VkExec *ex, const op_hdr *h) {
     const void *a = nvn_op_payload(h);
 #ifdef __APPLE__
     if (PC.n && !pass_clear_keeps(h->op)) pass_clears_flush(ex);
+    pc_bar_keeps = h->op == OP_BARRIER || h->op == OP_UPDATE_UB;
 #endif
     switch (h->op) {
     case OP_BEGIN: break;
@@ -1945,6 +1954,9 @@ static void op_one(VkExec *ex, const op_hdr *h) {
         break;
     default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
     }
+#ifdef __APPLE__
+    pc_bar_keeps = 0;
+#endif
 }
 
 // ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 0: the replay records every op on the submitting thread; the
