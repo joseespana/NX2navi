@@ -89,7 +89,7 @@ void gfx_window_closed(void) {
     vk_pipeline_save_exit();
     prof_write();   // plat_exit runs no atexit handlers
     rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
-    coop_shutdown();   // LEAVE and BYE to the room, before the process ends
+    coop_shutdown();   // leaves the room, before the process ends
     fs_save_flush();   // last: the game's threads still run until plat_exit, and a Commit after this one is refused
     if (restart) {
         cfg_setenv("NX2NAVI_REEXEC", NULL);   // the new process counts its own address-space retries (memory.c)
