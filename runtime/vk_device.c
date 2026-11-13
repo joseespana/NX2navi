@@ -221,6 +221,17 @@ static int create_instance(void) {
     // DLSS Frame Generation: Streamline's plugins call its naming functions even when they say it is off
     if (validate || (vk_dlssg_wanted() && instance_ext_present(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)))
         ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+#ifdef __APPLE__
+    // Mac pass labels (vk_crumbs.c vk_mac_labels_wanted): the pass marks become Metal debug signposts through
+    // VK_EXT_debug_utils, and our MoltenVK asks Metal for each encoder's status, so a failed command buffer names the
+    // pass or dispatch that faulted (tools/build_moltenvk.py, MVK_CONFIG_ENCODER_STATUS).
+    if (vk_mac_labels_wanted() && instance_ext_present(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+        int have = 0;
+        for (uint32_t i = 0; i < n_ext; i++) have |= !strcmp(ext[i], VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        if (!have) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        setenv("MVK_CONFIG_ENCODER_STATUS", "1", 0);
+    }
+#endif
     // armed, not wanted: the menu switches HDR on during the run (vk_hdr.c), and the extensions are fixed here
     if (vk_hdr_armed() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
         ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;

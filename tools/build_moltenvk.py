@@ -194,6 +194,42 @@ PATCHES = [
      'void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {\n'
      '\tif (hasResidencySet()) { return; }\n'
      '\tlock_guard<mutex> lock(_rezLock);\n'),
+    # A failed command buffer names its failed encoder. Metal reports each encoder's state (completed, faulted,
+    # affected, pending) and the debug signposts recorded in it only when the command buffer asked for that status
+    # (MTLCommandBufferErrorOptionEncoderExecutionStatus); MoltenVK asks only in its debug mode, which also logs every
+    # shader. MVK_CONFIG_ENCODER_STATUS=1 (set by the runtime, vk_device.c) asks for it alone, and the encoders that
+    # did not complete, with the one before the first of them, are logged as errors with their signposts: the
+    # runtime's pass marks (vk_crumbs.c) name which pass or dispatch each was.
+    ('MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm',
+     '\tif (getMVKConfig().debugMode) {\n'
+     '\t\tmtlCmdBuffDesc.errorOptions |= MTLCommandBufferErrorOptionEncoderExecutionStatus;\n',
+     '\tstatic const bool encoderStatus = [](){ const char* e = getenv("MVK_CONFIG_ENCODER_STATUS");\n'
+     '\t\treturn e && *e && strcmp(e, "0") != 0; }();\n'
+     '\tif (getMVKConfig().debugMode || encoderStatus) {\n'
+     '\t\tmtlCmdBuffDesc.errorOptions |= MTLCommandBufferErrorOptionEncoderExecutionStatus;\n'),
+    ('MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm',
+     '\tif (NSArray<id<MTLCommandBufferEncoderInfo>>* mtlEncInfo = mtlCmdBuff.error.userInfo[MTLCommandBufferEncoderInfoErrorKey]) {\n'
+     '\t\tMVKLogInfo(',
+     '\tif (NSArray<id<MTLCommandBufferEncoderInfo>>* encs = mtlCmdBuff.error.userInfo[MTLCommandBufferEncoderInfoErrorKey]) {\n'
+     '\t\tid<MTLCommandBufferEncoderInfo> prev = nil;\n'
+     '\t\tbool shownPrev = false;\n'
+     '\t\tfor (id<MTLCommandBufferEncoderInfo> enc in encs) {\n'
+     '\t\t\tif (enc.errorState != MTLCommandEncoderErrorStateCompleted) {\n'
+     '\t\t\t\tif (prev && !shownPrev) {\n'
+     '\t\t\t\t\tMVKLogError("Encoder before it: %s: %s; signposts: %s", prev.label.UTF8String,\n'
+     '\t\t\t\t\t\tmvkStringFromMTLCommandEncoderErrorState(prev.errorState),\n'
+     '\t\t\t\t\t\t[prev.debugSignposts componentsJoinedByString: @", "].UTF8String);\n'
+     '\t\t\t\t}\n'
+     '\t\t\t\tshownPrev = true;\n'
+     '\t\t\t\tMVKLogError("Encoder %s: %s; signposts: %s", enc.label.UTF8String,\n'
+     '\t\t\t\t\tmvkStringFromMTLCommandEncoderErrorState(enc.errorState),\n'
+     '\t\t\t\t\t[enc.debugSignposts componentsJoinedByString: @", "].UTF8String);\n'
+     '\t\t\t}\n'
+     '\t\t\tprev = enc;\n'
+     '\t\t}\n'
+     '\t}\n'
+     '\tif (NSArray<id<MTLCommandBufferEncoderInfo>>* mtlEncInfo = mtlCmdBuff.error.userInfo[MTLCommandBufferEncoderInfoErrorKey]) {\n'
+     '\t\tMVKLogInfo('),
 ]
 
 

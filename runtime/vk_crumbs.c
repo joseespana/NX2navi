@@ -113,6 +113,52 @@ int vk_pass_marks_want_nv(void) {
     return e && *e && strcmp(e, "0") != 0;
 }
 
+#ifdef __APPLE__
+// Mac pass labels. Metal has no breadcrumb writes, but a command buffer that asked for its encoders' status (our
+// MoltenVK, MVK_CONFIG_ENCODER_STATUS, set by vk_device.c create_instance) reports on failure which encoder faulted
+// and the debug signposts recorded in it. Each pass and dispatch inserts the signpost "nx2navi mark <id>" into its own
+// encoder: a pass right after vkCmdBeginRendering (vk_exec.c vk_exec_pass_begin, mark end 2), a dispatch at its end
+// mark, right after the dispatch, while its compute encoder is still the current one. A lost device then writes the
+// ring's records to <log>.marks.txt (mac_marks_dump), where the faulted encoder's mark is looked up.
+static PFN_vkCmdInsertDebugUtilsLabelEXT mtl_label;
+
+int vk_mac_labels_wanted(void) {
+    const char *e = cfg_get("NX2NAVI_PASS_CRUMBS");
+    return !(e && !strcmp(e, "0"));
+}
+
+static void describe_mark(uint32_t id, char *o, size_t size);
+
+// The signpost names the mark only: what the mark was is in the dump (mac_marks_dump), which keeps the work per pass to
+// one short string.
+static void mtl_label_cmd(VkCommandBuffer cb, uint32_t id) {
+    char name[32];
+    snprintf(name, sizeof name, "nx2navi mark %u", (unsigned)id);
+    VkDebugUtilsLabelEXT l = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = name};
+    mtl_label(cb, &l);
+}
+
+// The records of the newest marks, oldest first, to <log>.marks.txt. A frame makes several hundred marks and two or
+// three frames can be in flight, so the whole ring goes out.
+static void mac_marks_dump(void) {
+    const char *log = rt_log_path();
+    if (!mtl_label || !seq) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s.marks.txt", log ? log : "nx2navi");   // no log file: the working directory
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    uint32_t first = seq >= VK_PASS_MARKS ? seq - VK_PASS_MARKS + 1 : 1;
+    char t[640];
+    for (uint32_t id = first; id && id <= seq; id++) {
+        describe_mark(id, t, sizeof t);
+        fprintf(f, "mark %u: %s\n", (unsigned)id, t);
+    }
+    fclose(f);
+    rt_log("vk: the newest %u pass marks are in %s; the encoder MoltenVK names as faulted carries its mark as a "
+           "signpost", (unsigned)(seq - first + 1), path);
+}
+#endif
+
 static void pass_marks_init(VkCtx *c) {
     const char *e = cfg_get("NX2NAVI_PASS_CRUMBS");
     int off = e && !strcmp(e, "0");
@@ -122,6 +168,17 @@ static void pass_marks_init(VkCtx *c) {
     // Timestamp profiling needs pass labels, but no vendor breadcrumb extension.
     const char *timing = cfg_get("NX2NAVI_GPU_PASSES");
     int timestamps = timing && *timing && strcmp(timing, "0");
+#ifdef __APPLE__
+    mtl_label = vk_mac_labels_wanted()
+                    ? (PFN_vkCmdInsertDebugUtilsLabelEXT)vkGetInstanceProcAddr(c->instance, "vkCmdInsertDebugUtilsLabelEXT")
+                    : NULL;
+    if (mtl_label) {
+        vk_pass_marks_on = 1;
+        rt_log("vk: pass marks on as Metal debug signposts, with Metal's encoder status for a failed command buffer "
+               "(NX2NAVI_PASS_CRUMBS=0 turns them off)");
+        return;
+    }
+#endif
     vk_pass_marks_on = pm_amd || set_checkpoint || timestamps;
     if (timestamps && !pm_amd && !set_checkpoint)
         rt_log("vk: pass labels on for timestamp profiling; vendor breadcrumbs unavailable");
@@ -136,6 +193,11 @@ static void pass_marks_init(VkCtx *c) {
 
 
 void vk_pass_mark_cmd(VkCommandBuffer cb, uint32_t id, int end) {
+#ifdef __APPLE__
+    if (mtl_label && (end == 2 || (end == 1 && ring[id & (VK_PASS_MARKS - 1)].kind == VK_MARK_DISPATCH)))
+        mtl_label_cmd(cb, id);
+    if (end == 2) return;   // the label inside a pass only
+#endif
     if (pt_pool && pt_timed[id & (VK_PASS_MARKS - 1)] == 1)
         vkCmdWriteTimestamp(cb, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pt_pool,
                             (id & (VK_PASS_MARKS - 1)) * 2 + (end != 0));
@@ -712,6 +774,9 @@ static void nv_report(void) {
 
 void vk_pass_marks_report(void) {
     if (!vk_pass_marks_on) return;
+#ifdef __APPLE__
+    mac_marks_dump();
+#endif
     uint32_t started, finished;
     char t[2048];
     if (vk_pass_marks_read(&started, &finished)) {

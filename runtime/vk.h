@@ -191,6 +191,11 @@ void vk_gpu_gap_note(int kind, uint64_t units);
 extern int vk_pass_marks_on;
 // vk_device.c create_device, before vkCreateDevice: 1 when NX2NAVI_PASS_CRUMBS asks for NVIDIA checkpoints.
 int vk_pass_marks_want_nv(void);
+#ifdef __APPLE__
+// vk_device.c create_instance: 1 unless NX2NAVI_PASS_CRUMBS=0. Every pass and dispatch then carries a Metal debug
+// signpost "nx2navi mark <id>" (vk_crumbs.c), and a lost device writes the marks' records beside the log.
+int vk_mac_labels_wanted(void);
+#endif
 // The next mark: records its start into cb (through the recorder thread when it owns cb) and returns its ring record,
 // id, kind and fence set, for the caller to fill. NULL when pass marks are off. Replay thread only.
 VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence);

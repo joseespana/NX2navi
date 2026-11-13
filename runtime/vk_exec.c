@@ -1033,6 +1033,9 @@ void vk_exec_pass_begin(VkExec *ex) {
                           .pDepthAttachment = ex->pass_depth ? &da : NULL,
                           .pStencilAttachment = ex->pass_stencil ? &sa : NULL};
     vkCmdBeginRendering(ex->cb, &ri);
+#ifdef __APPLE__
+    if (m) rec_pass_mark(ex->cb, m->id, 2);   // the mark as a signpost inside the pass's render encoder (vk_crumbs.c)
+#endif
     vk_exec_frame.passes++;
     ex->recorded++;
     ex->in_pass = 1;
