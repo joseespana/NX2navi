@@ -83,8 +83,7 @@ static int spare_type(const VkCtx *c, uint32_t type) {
 uint64_t vk_headroom_held(void) { return (uint64_t)__atomic_load_n(&H.held, __ATOMIC_RELAXED); }
 
 static void VKAPI_PTR on_allocate(VmaAllocator a, uint32_t type, VkDeviceMemory m, VkDeviceSize size, void *user) {
-    (void)a, (void)m, (void)size, (void)user;
-    perf_mark_add(PERF_M_DEVMEM, 0, size);   // NX2NAVI_TRACE=perf: every block and dedicated allocation VMA makes
+    (void)a, (void)m, (void)size, (void)user;   // the trace's mark of the allocation, with its time: vk_device.c timed_alloc
     if (!H.on || type >= 64) return;
     if (plat_thread_id() == H.tid) {
         plat_inc64(&H.made);
@@ -98,10 +97,19 @@ static void VKAPI_PTR on_allocate(VmaAllocator a, uint32_t type, VkDeviceMemory 
     plat_event_set(&H.ev);
 }
 
+// NX2NAVI_TEX_COMPACT: every device memory VMA gives back to the driver is reported to the texture compaction, which
+// counts the blocks its pass emptied (vk_texture.c vk_texture_block_freed). Any thread; the callback takes no lock.
+static void VKAPI_PTR on_free(VmaAllocator a, uint32_t type, VkDeviceMemory m, VkDeviceSize size, void *user) {
+    (void)a, (void)type, (void)size, (void)user;
+    vk_texture_block_freed((uint64_t)(uintptr_t)m);
+}
+
 const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void) {
     static const VmaDeviceMemoryCallbacks cb = {.pfnAllocate = on_allocate};
+    static const VmaDeviceMemoryCallbacks cb_free = {.pfnAllocate = on_allocate, .pfnFree = on_free};
     const char *v = cfg_get("NX2NAVI_VRAM_HEADROOM");   // empty is unset: the key has no settings row for cfg_bool
     H.on = !v || !*v || cfg_bool("NX2NAVI_VRAM_HEADROOM");
+    if (vk_texture_compact_on()) return &cb_free;   // on_allocate does nothing for the headroom while H.on is 0
     return H.on ? &cb : NULL;
 }
 
@@ -117,7 +125,16 @@ static int room(const VkCtx *c, uint32_t type, VkDeviceSize block) {
     VmaBudget b[VK_MAX_MEMORY_HEAPS];
     vmaGetHeapBudgets(c->vma, b);
     const VmaBudget *h = &b[c->mem_props.memoryTypes[type].heapIndex];
-    return h->budget && h->usage + 2 * block <= h->budget / 100 * 85;
+    if (!h->budget || h->usage + 2 * block > h->budget / 100 * 85) return 0;
+    // A budget taken as smaller for a test (NX2NAVI_VRAM_BUDGET_MB, vk_mem_vram) is what the mirrors and the textures
+    // go by; measured against the driver's budget alone, a capped run kept its spare blocks where the card it stands
+    // for keeps none. Only then: without a cap the heap's own figure above decides, heap by heap.
+    uint64_t all = 0, used, capped;
+    int exact;
+    for (uint32_t i = 0; i < c->mem_props.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++)
+        if (c->mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) all += b[i].budget;
+    if (vk_mem_vram(&used, &capped, &exact) && capped < all && used + 2 * block > capped / 100 * 85) return 0;
+    return 1;
 }
 
 static void drop_anchor(const VkCtx *c, uint32_t type) {

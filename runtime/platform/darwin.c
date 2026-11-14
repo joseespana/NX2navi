@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libproc.h>
+#include <malloc/malloc.h>
 #include <libunwind.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -145,15 +146,24 @@ static void alt_stack(void) {
     sigaltstack(&ss, NULL);
 }
 
+static __thread char thread_name[32];   // the name the thread was made with (plat_thread_name)
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
     qos_self = t;
+    memcpy(thread_name, t->name, sizeof thread_name);
     alt_stack();
     if (t->name[0]) pthread_setname_np(t->name);
     t->fn(t->arg);
+    plat_thread_end_run();   // what the other files keep per thread (platform.h plat_thread_end_hook)
     __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
     return NULL;
 }
+
+const char *plat_thread_name(void) { return thread_name[0] ? thread_name : NULL; }
+
+// The crash report runs on the signal stack each thread gets (alt_stack), so nothing is kept back here.
+void plat_stack_guarantee(void) {}
 
 PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) {
     return plat_thread_new_ex(fn, arg, name, 0);
@@ -1876,6 +1886,91 @@ void plat_exit(int code) {
     fflush(stdout);
     fflush(stderr);
     _exit(code);
+}
+
+// The end of a fatal error or a lost device: at once, without the exit handlers (platform.h).
+void plat_terminate(int code) {
+    fflush(stderr);
+    _exit(code);
+}
+
+// The exit notes, the console's settings and hardware watchpoints are Windows' (platform.h); nothing here.
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n)) { (void)log, (void)queued; }
+void plat_exit_note_modules(void) {}
+void plat_exit_orderly(void) {}
+int plat_console_setup(void (*on_close)(const char *what)) {
+    (void)on_close;
+    return 0;
+}
+int plat_watch_set(const uint64_t *addr, const int *len, int n, PlatWatchHit hit) {
+    (void)addr, (void)len, (void)n, (void)hit;
+    return -1;
+}
+
+int plat_stderr_write(const void *p, size_t n) {
+    for (const char *c = p; n;) {
+        ssize_t k = write(2, c, n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return 0;
+        c += k, n -= (size_t)k;
+    }
+    return 1;
+}
+
+// The process's file descriptors, from the kernel's list of them (proc_pidinfo PROC_PIDLISTFDS). NULL on failure;
+// *n their count.
+static struct proc_fdinfo *fd_list(int *n) {
+    *n = 0;
+    int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, NULL, 0);
+    if (bytes <= 0) return NULL;
+    bytes += 64 * (int)sizeof(struct proc_fdinfo);   // room for descriptors opened meanwhile
+    struct proc_fdinfo *v = malloc((size_t)bytes);
+    if (!v) return NULL;
+    bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, v, bytes);
+    if (bytes <= 0) { free(v); return NULL; }
+    *n = bytes / (int)sizeof *v;
+    return v;
+}
+
+uint32_t plat_handle_count(void) {
+    int n;
+    struct proc_fdinfo *v = fd_list(&n);
+    free(v);
+    return v ? (uint32_t)n : 0;
+}
+
+// By the kernel's kind of each descriptor (vnode, socket, pipe, kqueue...).
+int plat_handle_census(PlatHandleKind *out, int max) {
+    int nfd;
+    struct proc_fdinfo *v = max > 0 ? fd_list(&nfd) : NULL;
+    if (!v) return -1;
+    int n = 0;
+    for (int i = 0; i < nfd; i++) {
+        static const char *const kinds[] = {"atalk", "vnode", "socket", "pshm", "psem", "kqueue", "pipe", "fsevents",
+                                            "netpolicy", "channel", "nexus"};
+        uint32_t t = v[i].proc_fdtype;
+        char kind[32];
+        if (t < sizeof kinds / sizeof *kinds) snprintf(kind, sizeof kind, "%s", kinds[t]);
+        else snprintf(kind, sizeof kind, "type %u", t);
+        int k = 0;
+        while (k < n && strcmp(out[k].name, kind)) k++;
+        if (k == n) {
+            if (n == max) k = n - 1, snprintf(out[k].name, sizeof out[k].name, "%s", "(more kinds)");
+            else snprintf(out[n].name, sizeof out[n].name, "%s", kind), out[n++].n = 0;
+        }
+        out[k].n++;
+    }
+    free(v);
+    return n;
+}
+
+// The malloc zones' statistics, every zone together.
+void plat_heap_info(PlatHeapInfo *h) {
+    memset(h, 0, sizeof *h);
+    malloc_statistics_t st;
+    malloc_zone_statistics(NULL, &st);
+    h->committed = st.size_allocated;
+    h->used = st.size_in_use;
 }
 
 int plat_setenv(const char *name, const char *value) {

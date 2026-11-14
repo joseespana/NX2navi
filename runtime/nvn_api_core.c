@@ -64,7 +64,12 @@ static void ov_memcpy(Cpu *c) {
 }
 HOST_OVERRIDE("memcpy", ov_memcpy);
 
-__attribute__((weak)) void nvn_submit_prepare(const uint64_t *handles, int n) { (void)handles, (void)n; }
+__attribute__((weak)) void nvn_submit_prepare(const uint64_t *handles, uint64_t *out, int n) {
+    memcpy(out, handles, sizeof *out * (size_t)n);
+}
+__attribute__((weak)) void nvn_submit_done(const uint64_t *handles, const uint64_t *out, int n) {
+    (void)handles, (void)out, (void)n;
+}
 __attribute__((weak)) void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     memcpy(out, handles, sizeof *out * (size_t)n);
 }
@@ -236,9 +241,22 @@ NVN_API(nvnDeviceRegisterFastClearDepth) { ret_x(c, 0); }
 NVN_API(nvnDeviceGetImageHandle) { ret_x(c, (uint64_t)(int64_t)(int)arg_x(c, 1)); }
 // NVNtextureHandle nvnDeviceGetTextureHandle(const NVNdevice *d, int texture_id, int sampler_id):
 // texture id (20 bits) | sampler id << 20, the encoding the replay decodes (NVN_HANDLE_TEX / NVN_HANDLE_SAMP)
+// An id out of range (-1: the game had no texture to give, as when its render-target heap is full) gets texture
+// slot 0 and sampler slot 0: the first 256 slots of both pools are reserved (nvnDeviceGetInteger 0x11 and 0x12 above)
+// and no game registers into them, so slot 0 holds the stand-in. That holds for a draw that binds the handle, where
+// handle 0 is "no texture" (vk_exec_draw.c), and for a shader that takes the handle out of a uniform buffer and
+// indexes the pool arrays with it: slot 0 is inside their VK_POOL_TEX entries, which a slot past them is not.
+// Ending the game here turned one missing texture into a crash.
 NVN_API(nvnDeviceGetTextureHandle) {
     int tid = (int)arg_x(c, 1), sid = (int)arg_x(c, 2);
-    if (tid < 0 || tid >= (1 << 20) || sid < 0 || sid >= (1 << 12)) rt_fatal("nvn: texture handle ids out of range %d/%d", tid, sid);
+    if (tid < 0 || tid >= (1 << 20) || sid < 0 || sid >= (1 << 12)) {
+        static int said;
+        if (said < 8 && ++said)
+            rt_log("nvn: texture handle asked for with ids out of range (texture %d, sampler %d): the handle of the "
+                   "reserved slot 0 is given, which draws the stand-in", tid, sid);
+        if (tid < 0 || tid >= (1 << 20)) tid = 0;
+        if (sid < 0 || sid >= (1 << 12)) sid = 0;
+    }
     ret_x(c, (uint64_t)tid | (uint64_t)sid << 20);
 }
 // NVNtextureHandle nvnDeviceGetTexelFetchHandle(const NVNdevice *d, int texture_id)
@@ -290,10 +308,24 @@ NVN_API(nvnMemoryPoolBuilderSetFlags) { ((pool_builder_t *)arg_p(c, 0))->flags =
 // Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
 // loader threads, which held a virtual core through it while job workers waited (NX2NAVI_CORE_DIAG). The thread gives
 // the core up, as for any blocking host call.
+static void pool_finalize(pool_t *o);
+
 NVN_API(nvnMemoryPoolInitialize) {
     NVN_BLOCKING();
     pool_t *o = arg_p(c, 0);
     const pool_builder_t *s = arg_p(c, 1);
+    // A pool object initialized again without Finalize: the back end's record of the old pool (its import, a VRAM
+    // mirror, a physical pool's device-local memory, its device address table record and its GPU address range) was
+    // left behind for good, since nothing names it any more. It is finalized first, as nvnTextureInitialize does
+    // for a texture; the back end lets the memory go once the GPU is past the submissions that may use it.
+    if (o->magic == NVN_POOL_MAGIC) {
+        static uint64_t again;
+        uint64_t n = __atomic_add_fetch(&again, 1, __ATOMIC_RELAXED);
+        if (n <= 4 || !(n & (n - 1)))
+            rt_log("nvn: MemoryPoolInitialize: pool %p (%#llx bytes) initialized again without Finalize, finalized first "
+                   "(%llu so far)", (void *)o->mem, (unsigned long long)o->size, (unsigned long long)n);
+        pool_finalize(o);
+    }
     memset(o, 0, sizeof *o);
     o->magic = NVN_POOL_MAGIC;
     o->flags = s->flags;
@@ -320,9 +352,7 @@ NVN_API(nvnMemoryPoolInitialize) {
     ret_x(c, ok);
 }
 // void nvnMemoryPoolFinalize(NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolFinalize) {
-    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
-    pool_t *o = arg_p(c, 0);
+static void pool_finalize(pool_t *o) {
     if (o->magic != NVN_POOL_MAGIC) return;
     motion_owner_forget_range((uint64_t)(uintptr_t)o->mem,o->size);
     if (pool_gpu_visible(o)) index_del(o);
@@ -331,6 +361,11 @@ NVN_API(nvnMemoryPoolFinalize) {
     o->mem = o->game_mem;
     o->span = 0;
     o->magic = 0;
+}
+
+NVN_API(nvnMemoryPoolFinalize) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
+    pool_finalize(arg_p(c, 0));
 }
 static uint64_t flush_stat[2][3][2];   // nvn_flush_stats
 
@@ -675,9 +710,11 @@ static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 // core given up (section 2.2), or queued for the replay thread (NX2NAVI_REPLAY_ASYNC, vk_backend.c); the newest fence
 // value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
 // for both.
-// NX2NAVI_TRACE=perf (nvn_api.h): which threads submit and present, and whether two of these calls run at once. The
-// synchronous replay's front end (vk_backend.c submit_sync, vk_be_present's held present, nvn_submits_in_frame) takes
-// no lock of its own, so it relies on one thread at a time; this tells a run whether that holds.
+// NX2NAVI_TRACE=perf (nvn_api.h): which threads submit and present, and whether two of these calls run at once, which
+// happens in play (at area changes). With the replay on the submitting threads they take turns where it matters:
+// replays on the submission lock (vk_sync.c sub_lock), a frame's bookkeeping at its present between two replays
+// (vk_frame_owed.h), a held present put out by one thread and in order (vk_present_held.h), and a second submission of
+// a recording in flight on a clone of its own (nvn_submit_guard.h). An overlap line counts; it is not a fault.
 void nvn_call_note(int present, uintptr_t q, int enter) {
     if (!(rt_trace & RT_TRACE_PERF)) return;
     static volatile int32_t inside;
@@ -717,7 +754,7 @@ NVN_API(nvnQueueSubmitCommands) {
     NVN_BLOCKING();
     nvn_call_note(0, (uintptr_t)q, 1);
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
-    q->submits++;
+    __atomic_add_fetch(&q->submits, 1, __ATOMIC_RELAXED);   // two of the game's threads may submit on one queue at once
     uint64_t f;
     if (gfx_replay_async()) {
         // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
@@ -732,10 +769,16 @@ NVN_API(nvnQueueSubmitCommands) {
         plat_mutex_unlock(&submit_lock);
         if (hs != local) free(hs);
     } else {
-        nvn_submit_prepare(h, n);
+        // Another of the game's threads may submit the same recording meanwhile: a second submission in flight gets a
+        // clone of its own to resolve and replay (nvn_api_cmd.c nvn_submit_prepare), freed after (nvn_submit_done).
+        uint64_t local[32], *hs = n <= 32 ? local : malloc(sizeof *hs * (size_t)n);
+        if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
+        nvn_submit_prepare(h, hs, n);
         gfx_submit_queue = (uintptr_t)q;
-        f = gfx_backend()->submit(h, n);
+        f = gfx_backend()->submit(hs, n);
         gfx_submit_queue = 0;
+        nvn_submit_done(h, hs, n);
+        if (hs != local) free(hs);
     }
     uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}

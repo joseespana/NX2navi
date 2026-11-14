@@ -55,6 +55,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_DESC] = "Stops screen tearing. Off lowers input delay slightly.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "VSync", [UI_MENU_PRESENT_IMMEDIATE] = "Immediate",
     [UI_MENU_PRESENT_IN_USE] = "in use: %s",
+    [UI_MENU_LOW_LATENCY] = "Low latency",
+    [UI_MENU_LOW_LATENCY_DESC] = "The graphics driver holds each frame's start, so the controller is read as late as "
+                                 "possible (NVIDIA Reflex, AMD Anti-Lag). It keeps the frame rate limit too. Boost "
+                                 "keeps the graphics card at full clock.",
+    [UI_MENU_LOW_LATENCY_BOOST] = "On + Boost",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "this graphics driver has no low-latency mode",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "DLSS frame generation uses its own",
+    [UI_MENU_LOW_LATENCY_FG] = "off while frame generation runs on this card",
+    [UI_MENU_LOW_LATENCY_FAILED] = "in use: off, the driver refused it (see lowlat in the log)",
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "The graphics card that runs the game.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
@@ -73,6 +82,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                               "sharper than bilinear. Smaller window (Ocarina draws 2560 x 1440): the picture is shrunk "
                               "and FSR sharpens it by the strength below.",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear",
+    [UI_MENU_UPSCALING_NATIVE] = "Native (100%)",
     [UI_MENU_GAME_ASPECT] = "Widescreen",
     [UI_MENU_GAME_ASPECT_DESC] = "Widens the view. HUD and menus stay 16:9.",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9 (the game's)", [UI_MENU_GAME_ASPECT_WINDOW] = "Window shape",
@@ -89,93 +99,6 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_TEX_DETAIL_DESC] = "Sharpness of large surface textures. Reduced and Low leave out their largest versions, so that an area fits the video memory of 6 and 8 GB cards; only surfaces seen up close look softer. Automatic picks by the card's video memory.",
     [UI_MENU_TEX_DETAIL_AUTO] = "Automatic: %s",
     [UI_MENU_TEX_DETAIL_FULL] = "Full", [UI_MENU_TEX_DETAIL_REDUCED] = "Reduced", [UI_MENU_TEX_DETAIL_LOW] = "Low",
-    [UI_MENU_LOWEND_INTRO] = "The settings of the low-end GPU mode. Each can be changed here; most take effect after a restart.",
-    [UI_MENU_LOWEND_RESTART] = "The mode turns on after a restart. Its settings are listed here then.",
-    [UI_MENU_LOWEND_MEMORY] = "Video memory and textures",
-    [UI_MENU_LOWEND_RENDER] = "Rendering",
-    [UI_MENU_LOWEND_BUILD] = "Build",
-    [UI_MENU_LOWEND_DIAG] = "Diagnostics",
-    [UI_MENU_LOWEND_RELEASED] = "Released textures kept",
-    [UI_MENU_LOWEND_RELEASED_DESC] = "How many textures the game has released are kept as they are; past it only those that "
-                                   "lose nothing when dropped go. Fewer leaves more video memory for the rest; more "
-                                   "saves making them again; too few lets some blink black for a moment. Auto: one per 2 MB "
-                                   "of the video memory budget, 2048 to 8192.",
-    [UI_MENU_LOWEND_CLOBBER] = "Fix overwritten textures",
-    [UI_MENU_LOWEND_CLOBBER_DESC] = "A texture the game reads after another image was drawn over its memory gets memory of "
-                                  "its own. Fixes the teal splotches in Kokiri Forest's fog.",
-    [UI_MENU_LOWEND_MIRROR_HOT] = "Pools copied every frame stay in system memory",
-    [UI_MENU_LOWEND_MIRROR_HOT_DESC] = "A game memory pool whose copies to and from video memory each frame reach this "
-                                     "percentage of its size is read by the GPU from system memory instead, if the "
-                                     "CPU does not write it (a pool it refills each frame stays in video memory: read "
-                                     "in place, the GPU saw the next frame's data). For GPUs and buses short of "
-                                     "bandwidth; 25 suits an RX 580. 0: off.",
-    [UI_MENU_LOWEND_RESERVE] = "Video memory kept free",
-    [UI_MENU_LOWEND_RESERVE_DESC] = "Room kept free in each video memory heap for what FidelityFX (FSR 3.1, frame generation) and the "
-                                  "driver allocate on their own: a heap with less than this left takes no new allocation while "
-                                  "another heap can. Off: video memory can fill up with frame generation on, and the game ends.",
-    [UI_MENU_LOWEND_HEAP_LIMIT] = "Video memory heap limit",
-    [UI_MENU_LOWEND_HEAP_LIMIT_DESC] = "Auto: on GPUs with a second video memory heap (an RX 580 shows 6 GB and 2 GB), "
-                                     "each heap is filled only to its budget before the next one is used, so the "
-                                     "driver does not run out. Off: no limit.",
-    [UI_MENU_LOWEND_UPLOAD_BATCH] = "Upload batch limit",
-    [UI_MENU_LOWEND_UPLOAD_BATCH_DESC] = "Texture uploads waiting in staging memory are sent to the GPU early once they "
-                                       "hold this much, so an area load cannot run video memory out.",
-    [UI_MENU_LOWEND_NO_LIMIT] = "No limit",
-    [UI_MENU_LOWEND_ASTC_KEEP] = "Keep the ASTC decode buffer",
-    [UI_MENU_LOWEND_ASTC_KEEP_DESC] = "The buffer that GPU-decodes compressed textures is kept between upload batches "
-                                    "instead of being allocated again for each one.",
-    [UI_MENU_LOWEND_MESH_EMU] = "Mesh shader emulation",
-    [UI_MENU_LOWEND_MESH_EMU_DESC] = "Draws grass, moss and other foliage on GPUs without mesh shaders (AMD RX 400/500 "
-                                   "and Vega, GTX 10-series and older), with compute shaders. GPUs with mesh shaders "
-                                   "ignore it.",
-    [UI_MENU_LOWEND_MESH_NATIVE] = "this GPU has mesh shaders",
-    [UI_MENU_LOWEND_MESH_MB] = "Mesh emulation memory",
-    [UI_MENU_LOWEND_MESH_MB_DESC] = "Video memory for the emulated meshes' vertices and indices, in MB.",
-    [UI_MENU_LOWEND_MESH_BATCH] = "Mesh emulation before the pass",
-    [UI_MENU_LOWEND_MESH_BATCH_DESC] = "The emulated mesh stages of a render pass run before the pass in a command buffer "
-                                     "of their own, instead of splitting the pass at every emulated draw. Off: the "
-                                     "split, as before.",
-    [UI_MENU_LOWEND_MESH_TASKS] = "Mesh emulation task records",
-    [UI_MENU_LOWEND_MESH_TASKS_DESC] = "Task records per submission for the emulated meshes. Raise it when the log reports "
-                                     "that a submission asked for more.",
-    [UI_MENU_LOWEND_VEC_INDEX] = "Vector index fix",
-    [UI_MENU_LOWEND_VEC_INDEX_DESC] = "Shaders read uniform vector components at computed indices whole and select the "
-                                    "component, for drivers that get such reads wrong. Auto: on AMD's own drivers.",
-    [UI_MENU_LOWEND_VEC_AUTO] = "Auto (AMD)",
-    [UI_MENU_LOWEND_GUEST_OPT] = "Optimised game code (-O2)",
-    [UI_MENU_LOWEND_GUEST_OPT_DESC] = "The next Rebuild the Game in the launcher compiles the game's code at -O2 instead "
-                                    "of -O1: the game's own threads run faster on a slower CPU. The build takes "
-                                    "several times longer.",
-    [UI_MENU_LOWEND_GUEST_OPT_NOTE] = "at the next rebuild",
-    [UI_MENU_LOWEND_FREEZE] = "Freeze idle memory after",
-    [UI_MENU_LOWEND_FREEZE_DESC] = "Submissions a memory region stays unwritten before it is made read-only, so the write "
-                                 "tracking can skip it. 1800 (about 15 s): few thaws and small tracking queries. 60: "
-                                 "the game thaws regions all the time and every thaw stalls a frame. Off: no stalls, but "
-                                 "the tracking scans all memory every frame.",
-    [UI_MENU_LOWEND_FOLIAGE] = "Foliage",
-    [UI_MENU_LOWEND_FOLIAGE_DESC] = "Full: all of it. Reduced: no small grass or moss on the ground; ferns, leaves and "
-                                  "other plants stay. Off: no foliage. Terrain, rocks and buildings always stay.",
-    [UI_MENU_LOWEND_FOLIAGE_FULL] = "Full",
-    [UI_MENU_LOWEND_FOLIAGE_REDUCED] = "Reduced",
-    [UI_MENU_LOWEND_RESULTS] = "Wait for GPU results",
-    [UI_MENU_LOWEND_RESULTS_DESC] = "After a frame's first submission the game waits until the GPU wrote the results it "
-                                  "reads back. All: events, counter and occlusion reports, write-backs. Without events: "
-                                  "a shorter wait; on an RX 580 nothing flickered.",
-    [UI_MENU_LOWEND_RESULTS_ALL] = "All",
-    [UI_MENU_LOWEND_RESULTS_NO_EVENTS] = "Without events",
-    [UI_MENU_LOWEND_ZSTD] = "Native data decompression",
-    [UI_MENU_LOWEND_ZSTD_DESC] = "Decompresses the game's zstd data with the PC's libzstd instead of the game's own "
-                               "decoder translated from the console. Lighter streaming while you move.",
-    [UI_MENU_LOWEND_ASYNC] = "Asynchronous replay",
-    [UI_MENU_LOWEND_ASYNC_DESC] = "Translates the game's GPU commands on a thread of their own instead of the game's, so "
-                                "the game prepares the next frame meanwhile.",
-    [UI_MENU_LOWEND_PASS_TIMES] = "Pass times in the log",
-    [UI_MENU_LOWEND_PASS_TIMES_DESC] = "GPU time of every render pass and dispatch goes to the log, with the largest "
-                                     "viewport each kind of pass draws with. Costs a little frame time.",
-    [UI_MENU_LOWEND_DUMP_KEY] = "Frame dump key",
-    [UI_MENU_LOWEND_DUMP_KEY_DESC] = "Each press of this key in the game window dumps the next frame (images and the "
-                                   "frame's passes) to the dump folder, for a glitch caught while it is on screen. "
-                                   "Windows only.",
     [UI_MENU_SHARPNESS] = "FSR sharpness",
     [UI_MENU_SHARPNESS_DESC] = "How sharp FSR makes the picture. 0 turns it off.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "only with AMD FSR 1 or FSR 3.1",
@@ -203,6 +126,44 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "Brightness of white in the game, in nits.",
     [UI_MENU_HDR_UI] = "HUD and menu brightness",
     [UI_MENU_HDR_UI_DESC] = "Brightness of the HUD and this menu, in nits.",
+    [UI_MENU_HDR_HUE] = "Hue correction",
+    [UI_MENU_HDR_HUE_DESC] = "How much bright colours keep the hue they have before the tone mapper; 0 lets them shift "
+                             "as the curve takes them.",
+    [UI_MENU_HDR_GAMMA] = "Gamma correction",
+    [UI_MENU_HDR_GAMMA_DESC] = "Shows the picture as a 2.2 or BT.1886 (2.4) display would, as the game was made to be "
+                               "seen; Off keeps the sRGB curve, with lighter shadows.",
+    [UI_MENU_HDR_TONEMAP] = "Tone mapper",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: the game's own curve at SDR brightness. PsychoV35: the scene through a model "
+                                 "of the eye's response, matched to the game's mid grey and tone, up to your display's "
+                                 "peak. RenoDRT: the game's SDR look carried up to the peak by brightness.",
+    [UI_MENU_HDR_EXPOSURE] = "Exposure",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "Brightness of the whole picture before the tone mapper; 100 % leaves it unchanged.",
+    [UI_MENU_HDR_HIGHLIGHTS] = "Highlights",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Brightness of the bright parts; 50 leaves them unchanged.",
+    [UI_MENU_HDR_SHADOWS] = "Shadows",
+    [UI_MENU_HDR_SHADOWS_DESC] = "Brightness of the dark parts; 50 leaves them unchanged.",
+    [UI_MENU_HDR_CONTRAST] = "Contrast",
+    [UI_MENU_HDR_CONTRAST_DESC] = "Contrast around mid grey; 50 leaves it unchanged.",
+    [UI_MENU_HDR_SATURATION] = "Saturation",
+    [UI_MENU_HDR_SATURATION_DESC] = "Strength of all colours; 50 leaves it unchanged.",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Highlight saturation",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Strength of the colours of the brightest parts; 50 leaves it unchanged.",
+    [UI_MENU_HDR_BLOWOUT] = "Blowout",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "Turns the brightest parts towards white; 0 keeps their colour.",
+    [UI_MENU_HDR_FLARE] = "Flare",
+    [UI_MENU_HDR_FLARE_DESC] = "Lifts the darkest parts as a little stray light would; 0 keeps black black.",
+    [UI_MENU_HDR_GRADE] = "Colour grading",
+    [UI_MENU_HDR_GRADE_DESC] = "How much of the game's own colour grading the HDR picture keeps; 0 is the scene without it.",
+    [UI_MENU_HDR_MIDGRAY] = "Mid grey",
+    [UI_MENU_HDR_MIDGRAY_DESC] = "Where the scene's mid grey lands. Vanilla: where the game's own curve puts it. Render: "
+                                 "at the scene's value, a little darker.",
+    [UI_MENU_HDR_MATCH_SLOPE] = "Match tone slope",
+    [UI_MENU_HDR_MATCH_SLOPE_DESC] = "Gives the mid tones the contrast of the game's own curve.",
+    [UI_MENU_HDR_TONE_SLOPE] = "Tone slope",
+    [UI_MENU_HDR_TONE_SLOPE_DESC] = "Steepness of the tone curve through mid grey; 50 leaves it unchanged.",
+    [UI_MENU_HDR_HUE_CLIP] = "Hue clip emulation",
+    [UI_MENU_HDR_HUE_CLIP_DESC] = "How much bright colours turn as they do where the game's SDR picture clips: fire "
+                                  "towards yellow and white. 0 keeps their hue.",
     [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
     [UI_MENU_SHADOW_SCALE_DESC] = "Sharper shadows. Higher costs more GPU power.",
     [UI_MENU_PCSS] = "Soft shadows",
@@ -263,6 +224,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FPS_RTSS] = "limited by RivaTuner Statistics Server",
     [UI_MENU_FPS_RTSS_READONLY] = "RivaTuner needs the game run as administrator",
     [UI_MENU_FPS_RTSS_IGNORED] = "RivaTuner does not limit this game; the game does",
+    [UI_MENU_FPS_RTSS_TWO] = "RivaTuner's own limit also applies: two limiters",
     [UI_MENU_REALTIME] = "Game speed follows the clock",
     [UI_MENU_REALTIME_DESC] = "Steps the game by real time, so a slow frame does not slow the game down.",
     [UI_MENU_CLOTH_REALTIME] = "Cloth on the clock",
@@ -276,6 +238,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_MODE_DOCKED] = "Docked", [UI_MENU_MODE_HANDHELD] = "Handheld",
     [UI_MENU_ASSUME_FOCUS] = "Keep running out of focus",
     [UI_MENU_ASSUME_FOCUS_DESC] = "Keeps the game running when you switch to another window.",
+    [UI_MENU_TEXT_SPEED] = "Text speed",
+    [UI_MENU_TEXT_SPEED_DESC] = "How fast the game's message windows show their text. Fast types three times as fast; "
+                                "instant shows each page at once. Text the game does not let you hurry, such as "
+                                "lines timed to a cutscene or a voice, keeps its speed.",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "Normal", [UI_MENU_TEXT_SPEED_FAST] = "Fast",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "Instant",
 
     [UI_MENU_MODS_BUILTIN] = "Built into the port", [UI_MENU_MODS_INSTALLED] = "Installed mods",
     [UI_MENU_MODS_NONE] = "No mods yet. Unpack a mod into the mods folder, one folder per mod with its romfs folder "
@@ -314,12 +282,28 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_CHANNELS_AUTO] = "Automatic", [UI_MENU_CHANNELS_STEREO] = "Stereo", [UI_MENU_CHANNELS_51] = "5.1 surround",
 
     [UI_MENU_MOTION] = "Motion controls", [UI_MENU_MOTION_DESC] = "Aim with the controller's gyro.",
+    [UI_MENU_SPRINT_BUTTON] = "Sprint button",
+    [UI_MENU_SPRINT_BUTTON_DESC] = "A button that makes Link sprint without rolling first. L3, the left stick's "
+                                   "click, has no other use. The game's B button sprints only while Link moves and "
+                                   "puts the weapon away as usual otherwise; with the game's Swap Jump Controls on, B "
+                                   "is the jump, so use L3.",
+    [UI_MENU_SPRINT_OFF] = "Off", [UI_MENU_SPRINT_B] = "The game's B button",
+    [UI_MENU_SPRINT_L3] = "L3 (left stick)",
+    [UI_MENU_SPRINT_MODE] = "Sprint mode",
+    [UI_MENU_SPRINT_MODE_DESC] = "Toggle: press once to sprint and again to stop. The sprint goes on through jumps "
+                                 "and ends when Link stops, attacks, rolls, targets, uses an item, swims or climbs. "
+                                 "Hold: Link sprints while the button is held.",
+    [UI_MENU_SPRINT_TOGGLE] = "Toggle", [UI_MENU_SPRINT_HOLD] = "Hold",
     [UI_MENU_RUMBLE_STRENGTH] = "Vibration strength",
     [UI_MENU_RUMBLE_STRENGTH_DESC] = "How strong the vibration is.",
     [UI_MENU_RUMBLE_CURVE] = "Vibration curve",
     [UI_MENU_RUMBLE_CURVE_DESC] = "Lower values make light vibration stronger.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Trigger vibration (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Also vibrates the triggers on Xbox controllers.",
+    [UI_MENU_RUMBLE_HD] = "HD vibration (Switch)",
+    [UI_MENU_RUMBLE_HD_DESC] = "Sends the game's detailed vibration to a Switch Pro Controller or Joy-Con as it is. "
+                               "The vibration strength still applies: its default is the game's own.",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "Needs a Switch Pro Controller or Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "Button layout",
     [UI_MENU_PAD_LAYOUT_DESC] = "Sets which button acts as A. Nintendo: by position, A right, B bottom, X top, Y "
                                 "left. Xbox and PlayStation: by label, A bottom, B right, X left, Y top (on a "
@@ -465,16 +449,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_AMIIBO_STATUS] = "Status: %s",
     [UI_MENU_MENU_LANG] = "Menu language", [UI_MENU_MENU_LANG_DESC] = "Language of this menu and the overlay.",
     [UI_MENU_MENU_LANG_AUTO] = "Automatic (from Windows)",
-    [UI_MENU_LOW_END_GPU] = "Low-end GPU mode (experimental)",
-    [UI_MENU_LOW_END_GPU_DESC] = "For older graphics cards and cards short of video memory. Runs the game's mesh shaders as compute shaders "
-                                 "where the card has none, keeps video memory within what the driver reports free, waits less for the GPU and "
-                                 "prepares frames on a thread of their own. Measured on a Radeon RX 580 only: it can show a dark or flickering "
-                                 "frame now and then, so leave it off on a newer card.",
     [UI_MENU_REPLAY_WORKERS] = "CPU helper threads (experimental)",
-    [UI_MENU_REPLAY_WORKERS_DESC] = "Uses more of your CPU's cores to prepare each frame for the graphics card. 0 turns it "
-                                    "off. 3 gave about 20% more frames a second on an 8-core CPU, and 5 a little more "
-                                    "with the settings below. Some players' games crashed with this on: set it back to "
-                                    "0 if yours does.",
+    [UI_MENU_REPLAY_WORKERS_DESC] = "Uses more of your CPU's cores to prepare each frame for the graphics card. Automatic "
+                                    "picks the number for your CPU: half its cores less one, none on four cores or fewer "
+                                    "and none on RX 6000 and older Radeon cards. 0 turns it off. 3 gave about 20% more "
+                                    "frames a second on an 8-core CPU. If your game crashes with this on, set it to 0.",
     [UI_MENU_REPLAY_PIPE] = "Helpers work ahead (experimental)",
     [UI_MENU_REPLAY_PIPE_DESC] = "The game carries on with the rest of the frame while the helper threads are still "
                                  "busy, instead of waiting for them. The number is how many batches of work the "
@@ -649,9 +628,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_CAPTURE_FAILED] = "Bug capture %d could not be saved",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
+    [UI_BOOT_COMPUTE] = "Compute pipelines: %lld of %lld", [UI_BOOT_DRIVER_CACHE] = "Driver cache: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
-    [UI_MENU_UPSCALING_DESC] = "How the picture is smoothed and scaled to your window.",
-    [UI_MENU_UPSCALING_DESC_FSR] = "How the picture is smoothed and scaled to your window.",
+    [UI_MENU_UPSCALING_DESC] = "How the picture is smoothed and scaled to your window. Native draws the 3D scene at "
+                               "the picture's full size with no upscaler: the sharpest, and the most GPU work.",
+    [UI_MENU_UPSCALING_DESC_FSR] = "How the picture is smoothed and scaled to your window. Native draws the 3D scene "
+                                   "at the picture's full size with no upscaler: the sharpest, and the most GPU work.",
     [UI_MENU_FRAMEGEN] = "Frame generation",
     [UI_MENU_FRAMEGEN_DESC] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1.",
     [UI_MENU_FRAMEGEN_OFF] = "Off",
@@ -661,8 +643,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
-    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. AMD FSR 3.1 is not offered "
-                                      "here: it needs amd_fidelityfx_vk.dll, which cannot be loaded.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. Native draws the 3D scene "
+                                      "at the picture's full size with no upscaler: the sharpest, and the most GPU "
+                                      "work. AMD FSR 3.1 is not offered here: it needs amd_fidelityfx_vk.dll, which "
+                                      "cannot be loaded.",
     [UI_MENU_FSR3_OFF] = "in use: off, FSR 3.1 is not available",
     [UI_MENU_FRAMEGEN_DESC_DLSS] = "Adds generated frames for smoother motion. Needs DLSS.",
     [UI_MENU_FRAMEGEN_NOTE_DLSS] = "needs DLSS",
@@ -684,6 +668,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_MULT_OLD_DLL] = "2x only: update the DLSS frame generation files",
     [UI_MENU_FRAMEGEN_UNAVAILABLE] = "in use: off: it needs an RTX 40 or newer; if you have one, see dlssg in the log",
     [UI_MENU_FRAMEGEN_OFF_FILES] = "in use: off, its files are missing",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "Adds generated frames for smoother motion, with any Upscaling choice.",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "Adds generated frames for smoother motion. NVIDIA DLSS needs a DLSS mode under "
+                                  "Upscaling when the game starts; it then runs with any Upscaling choice.",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "needs DLSS when the game starts",
     [UI_MENU_GAME_RES] = "Resolution",
     [UI_MENU_GAME_RES_DESC] = "Size of the game's picture; outside fullscreen the window takes it too. Higher is sharper "
                               "but costs more GPU power.",
@@ -722,6 +710,22 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "Вертикальная синхронизация",
     [UI_MENU_PRESENT_IMMEDIATE] = "Без ожидания",
     [UI_MENU_PRESENT_IN_USE] = "сейчас: %s",
+    [UI_MENU_LOW_LATENCY] = "Низкая задержка",
+    [UI_MENU_LOW_LATENCY_DESC] = "Драйвер видеокарты задерживает начало каждого кадра, чтобы ввод считывался как "
+                                 "можно позже (NVIDIA Reflex, AMD Anti-Lag). Он же держит ограничение частоты кадров. "
+                                 "Boost не даёт видеокарте снижать частоту.",
+    [UI_MENU_LOW_LATENCY_BOOST] = "Вкл. + Boost",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "у этого драйвера нет режима низкой задержки",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "генерация кадров DLSS использует свой режим",
+    [UI_MENU_LOW_LATENCY_FG] = "выключено, пока на этой видеокарте работает генерация кадров",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "Добавляет сгенерированные кадры для более плавного движения, с любым выбором в "
+                                  "Upscaling.",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "Добавляет сгенерированные кадры для более плавного движения. Для NVIDIA DLSS "
+                                  "нужен режим DLSS в Upscaling при запуске игры; после этого генерация работает с "
+                                  "любым "
+                                  "выбором в Upscaling.",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "нужен DLSS при запуске игры",
+    [UI_MENU_LOW_LATENCY_FAILED] = "сейчас: выкл., драйвер отказал (см. lowlat в журнале)",
     [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Видеокарта, на которой работает игра.",
     [UI_MENU_GPU_AUTO] = "Автоматически",
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
@@ -739,6 +743,17 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                               "билинейного. Окно меньше (Ocarina рисует 2560 × 1440): картинка уменьшается, и FSR "
                               "повышает её резкость на величину ниже.",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Билинейное",
+    [UI_MENU_UPSCALING_NATIVE] = "Родное (100%)",
+    [UI_MENU_UPSCALING_DESC] = "Как картинка сглаживается и масштабируется под окно. «Родное» рисует 3D-сцену в "
+                               "полном размере картинки без апскейлера: самая чёткая картинка и самая большая "
+                               "нагрузка на видеокарту.",
+    [UI_MENU_UPSCALING_DESC_FSR] = "Как картинка сглаживается и масштабируется под окно. «Родное» рисует 3D-сцену в "
+                                   "полном размере картинки без апскейлера: самая чёткая картинка и самая большая "
+                                   "нагрузка на видеокарту.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "Как картинка сглаживается и масштабируется под окно. «Родное» рисует 3D-сцену "
+                                      "в полном размере картинки без апскейлера: самая чёткая картинка и самая "
+                                      "большая нагрузка на видеокарту. AMD FSR 3.1 здесь не предлагается: ему нужен "
+                                      "amd_fidelityfx_vk.dll, который не удаётся загрузить.",
     [UI_MENU_GAME_ASPECT] = "Широкий экран",
     [UI_MENU_GAME_ASPECT_DESC] = "Расширяет обзор. Интерфейс и меню остаются 16:9.",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9 (как в игре)", [UI_MENU_GAME_ASPECT_WINDOW] = "По окну",
@@ -783,6 +798,44 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "Яркость белого в игре, в нитах.",
     [UI_MENU_HDR_UI] = "Яркость интерфейса и меню",
     [UI_MENU_HDR_UI_DESC] = "Яркость интерфейса и этого меню, в нитах.",
+    [UI_MENU_HDR_HUE] = "Коррекция оттенка",
+    [UI_MENU_HDR_HUE_DESC] = "Насколько яркие цвета сохраняют оттенок, который был до тональной кривой; при 0 они "
+                             "смещаются вместе с кривой.",
+    [UI_MENU_HDR_GAMMA] = "Коррекция гаммы",
+    [UI_MENU_HDR_GAMMA_DESC] = "Показывает картинку так, как её показал бы экран с гаммой 2.2 или BT.1886 (2.4), для "
+                               "которого игра делалась; «Выкл.» оставляет кривую sRGB с более светлыми тенями.",
+    [UI_MENU_HDR_TONEMAP] = "Тональная кривая",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: собственная кривая игры с яркостью SDR. PsychoV35: сцена через модель отклика "
+                                 "глаза, согласованная со средним серым и тоном игры, до пиковой яркости экрана. RenoDRT: "
+                                 "SDR-вид игры, доведённый до пика по яркости.",
+    [UI_MENU_HDR_EXPOSURE] = "Экспозиция",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "Яркость всей картинки до тональной кривой; 100 % оставляет её без изменений.",
+    [UI_MENU_HDR_HIGHLIGHTS] = "Света",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Яркость светлых участков; 50 оставляет их без изменений.",
+    [UI_MENU_HDR_SHADOWS] = "Тени",
+    [UI_MENU_HDR_SHADOWS_DESC] = "Яркость тёмных участков; 50 оставляет их без изменений.",
+    [UI_MENU_HDR_CONTRAST] = "Контраст",
+    [UI_MENU_HDR_CONTRAST_DESC] = "Контраст вокруг среднего серого; 50 оставляет его без изменений.",
+    [UI_MENU_HDR_SATURATION] = "Насыщенность",
+    [UI_MENU_HDR_SATURATION_DESC] = "Сила всех цветов; 50 оставляет её без изменений.",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Насыщенность светов",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Сила цвета самых ярких участков; 50 оставляет её без изменений.",
+    [UI_MENU_HDR_BLOWOUT] = "Выгорание",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "Уводит самые яркие участки к белому; 0 сохраняет их цвет.",
+    [UI_MENU_HDR_FLARE] = "Засветка",
+    [UI_MENU_HDR_FLARE_DESC] = "Приподнимает самые тёмные участки, как немного рассеянного света; 0 оставляет чёрное чёрным.",
+    [UI_MENU_HDR_GRADE] = "Цветокоррекция игры",
+    [UI_MENU_HDR_GRADE_DESC] = "Сколько собственной цветокоррекции игры сохраняет HDR-картинка; 0 — сцена без неё.",
+    [UI_MENU_HDR_MIDGRAY] = "Средний серый",
+    [UI_MENU_HDR_MIDGRAY_DESC] = "Куда попадает средний серый сцены. Vanilla: туда же, куда его ставит кривая игры. "
+                                 "Render: на значение сцены, чуть темнее.",
+    [UI_MENU_HDR_MATCH_SLOPE] = "Наклон тона как в игре",
+    [UI_MENU_HDR_MATCH_SLOPE_DESC] = "Даёт средним тонам контраст собственной кривой игры.",
+    [UI_MENU_HDR_TONE_SLOPE] = "Наклон тона",
+    [UI_MENU_HDR_TONE_SLOPE_DESC] = "Крутизна тональной кривой у среднего серого; 50 оставляет её без изменений.",
+    [UI_MENU_HDR_HUE_CLIP] = "Имитация сдвига оттенка",
+    [UI_MENU_HDR_HUE_CLIP_DESC] = "Насколько яркие цвета сдвигаются так, как при обрезке в SDR-картинке игры: огонь к "
+                                  "жёлтому и белому. 0 сохраняет их оттенок.",
     [UI_MENU_SHADOW_SCALE] = "Разрешение теней",
     [UI_MENU_SHADOW_SCALE_DESC] = "Более чёткие тени. Выше — больше нагрузка на видеокарту.",
     [UI_MENU_PCSS] = "Мягкие тени",
@@ -841,6 +894,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_FPS_RTSS] = "ограничивает RivaTuner Statistics Server",
     [UI_MENU_FPS_RTSS_READONLY] = "RivaTuner нужен запуск игры от администратора",
     [UI_MENU_FPS_RTSS_IGNORED] = "RivaTuner не ограничивает эту игру; ограничивает игра",
+    [UI_MENU_FPS_RTSS_TWO] = "действует и ограничение самого RivaTuner: два ограничителя",
     [UI_MENU_REALTIME] = "Скорость игры по часам",
     [UI_MENU_REALTIME_DESC] = "Игра идёт по реальному времени, медленный кадр её не замедляет.",
     [UI_MENU_CLOTH_REALTIME] = "Ткань по часам",
@@ -854,6 +908,12 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_MODE_DOCKED] = "В док-станции", [UI_MENU_MODE_HANDHELD] = "Портативный",
     [UI_MENU_ASSUME_FOCUS] = "Работать без фокуса",
     [UI_MENU_ASSUME_FOCUS_DESC] = "Игра продолжает работать, когда вы переключаетесь на другое окно.",
+    [UI_MENU_TEXT_SPEED] = "Скорость текста",
+    [UI_MENU_TEXT_SPEED_DESC] = "Как быстро окна сообщений игры показывают текст. Быстро: в три раза быстрее; "
+                                "мгновенно: каждая страница сразу целиком. Текст, который игра не даёт ускорить, "
+                                "например реплики в такт сценке или голосу, идёт с обычной скоростью.",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "Обычная", [UI_MENU_TEXT_SPEED_FAST] = "Быстро",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "Мгновенно",
 
     [UI_MENU_MODS_BUILTIN] = "Встроенные в порт", [UI_MENU_MODS_INSTALLED] = "Установленные моды",
     [UI_MENU_MODS_NONE] = "Модов пока нет. Распакуйте мод в папку mods, каждый мод в свою папку с папкой romfs внутри, и "
@@ -896,6 +956,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "Чем ниже, тем сильнее слабая вибрация.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Вибрация триггеров (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Вибрация также на курках контроллера Xbox.",
+    [UI_MENU_RUMBLE_HD] = "HD-вибрация (Switch)",
+    [UI_MENU_RUMBLE_HD_DESC] = "Передаёт детальную вибрацию игры на Switch Pro Controller или Joy-Con без изменений. "
+                               "Сила вибрации по-прежнему действует: значение по умолчанию — как в игре.",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "Нужен Switch Pro Controller или Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "Раскладка кнопок",
     [UI_MENU_PAD_LAYOUT_DESC] = "Какая кнопка работает как A. Nintendo: по положению, A справа, B снизу, X сверху, "
                                 "Y слева. Xbox и PlayStation: по подписи, A снизу, B справа, X слева, Y сверху (на "
@@ -1042,11 +1106,6 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_AMIIBO_STATUS] = "Состояние: %s",
     [UI_MENU_MENU_LANG] = "Язык меню", [UI_MENU_MENU_LANG_DESC] = "Язык этого меню и индикатора.",
     [UI_MENU_MENU_LANG_AUTO] = "Автоматически (из Windows)",
-    [UI_MENU_LOW_END_GPU] = "Режим для слабых видеокарт (экспериментальный)",
-    [UI_MENU_LOW_END_GPU_DESC] = "Для старых видеокарт и карт с малым объёмом видеопамяти. Меш-шейдеры игры выполняются как вычислительные там, "
-                                 "где карта их не поддерживает, видеопамять удерживается в пределах свободного объёма по данным драйвера, игра "
-                                 "меньше ждёт видеокарту, а кадры готовятся в отдельном потоке. Проверено только на Radeon RX 580: изредка "
-                                 "возможен тёмный или мерцающий кадр, поэтому на новой карте оставьте выключенным.",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
     [UI_MENU_DISCORD_RPC_DESC] = "Пока игра запущена, показывает «Играю в NX2navi» со временем игры в статусе "
                                  "Discord. Приложение выбирают discord_app_id и discord_image в nx2navi.ini.",
@@ -1209,6 +1268,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_CAPTURE_FAILED] = "Снимок ошибки %d не удалось сохранить",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
+    [UI_BOOT_COMPUTE] = "Вычислительные конвейеры: %lld из %lld", [UI_BOOT_DRIVER_CACHE] = "Кэш драйвера: %lld из %lld",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Некоторые читы меняют код игры и ещё не собраны в неё: они новые или изменены, "
                                     "либо прошлая пересборка не удалась или была отменена. Закрывает игру; установщик "
@@ -1274,6 +1334,21 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_DESC] = "Evita cortes na imagem. Desligado reduz um pouco o atraso.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "VSync", [UI_MENU_PRESENT_IMMEDIATE] = "Imediato",
     [UI_MENU_PRESENT_IN_USE] = "em uso: %s",
+    [UI_MENU_LOW_LATENCY] = "Baixa latência",
+    [UI_MENU_LOW_LATENCY_DESC] = "O driver de vídeo segura o início de cada quadro, para ler o controle o mais tarde "
+                                 "possível (NVIDIA Reflex, AMD Anti-Lag). Ele também mantém o limite de quadros. Boost "
+                                 "mantém a placa de vídeo em frequência máxima.",
+    [UI_MENU_LOW_LATENCY_BOOST] = "Ligado + Boost",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "este driver de vídeo não tem modo de baixa latência",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "a geração de quadros DLSS usa o seu próprio",
+    [UI_MENU_LOW_LATENCY_FG] = "desligado enquanto a geração de quadros roda nesta placa",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "Adiciona quadros gerados para um movimento mais suave, com qualquer opção em "
+                                  "Upscaling.",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "Adiciona quadros gerados para um movimento mais suave. O NVIDIA DLSS precisa de um "
+                                  "modo DLSS em Upscaling quando o jogo inicia; depois funciona com qualquer opção em "
+                                  "Upscaling.",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "precisa do DLSS ao iniciar o jogo",
+    [UI_MENU_LOW_LATENCY_FAILED] = "em uso: desligado, o driver recusou (veja lowlat no log)",
     [UI_MENU_GPU] = "Placa de vídeo", [UI_MENU_GPU_DESC] = "A placa de vídeo usada pelo jogo.",
     [UI_MENU_GPU_AUTO] = "Automática",
     [UI_MENU_PERF_OVERLAY] = "Indicador de desempenho",
@@ -1291,6 +1366,15 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                               "mais nítidos que o bilinear. Janela menor (Ocarina desenha 2560 x 1440): a imagem é "
                               "reduzida e o FSR aumenta a nitidez com a intensidade abaixo.",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear",
+    [UI_MENU_UPSCALING_NATIVE] = "Nativo (100%)",
+    [UI_MENU_UPSCALING_DESC] = "Como a imagem é suavizada e ajustada à janela. Nativo desenha a cena 3D no tamanho "
+                               "total da imagem, sem upscaler: a mais nítida, e a que mais exige da GPU.",
+    [UI_MENU_UPSCALING_DESC_FSR] = "Como a imagem é suavizada e ajustada à janela. Nativo desenha a cena 3D no "
+                                   "tamanho total da imagem, sem upscaler: a mais nítida, e a que mais exige da GPU.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "Como a imagem é suavizada e ajustada à janela. Nativo desenha a cena 3D no "
+                                      "tamanho total da imagem, sem upscaler: a mais nítida, e a que mais exige da "
+                                      "GPU. O AMD FSR 3.1 não é oferecido aqui: ele precisa do amd_fidelityfx_vk.dll, "
+                                      "que não pode ser carregado.",
     [UI_MENU_GAME_ASPECT] = "Tela larga",
     [UI_MENU_GAME_ASPECT_DESC] = "Amplia a visão. A interface e os menus continuam em 16:9.",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9 (o do jogo)", [UI_MENU_GAME_ASPECT_WINDOW] = "Formato da janela",
@@ -1305,11 +1389,18 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_90] = "90 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
     [UI_MENU_ASSUME_FOCUS] = "Continuar rodando fora de foco",
     [UI_MENU_ASSUME_FOCUS_DESC] = "Mantém o jogo rodando quando você troca de janela.",
+    [UI_MENU_TEXT_SPEED] = "Velocidade do texto",
+    [UI_MENU_TEXT_SPEED_DESC] = "A rapidez com que as janelas de mensagem do jogo mostram o texto. Rápida escreve três "
+                                "vezes mais rápido; instantânea mostra cada página de uma vez. Textos que o jogo não "
+                                "deixa apressar, como falas sincronizadas com uma cena ou uma voz, mantêm a velocidade.",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "Normal", [UI_MENU_TEXT_SPEED_FAST] = "Rápida",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "Instantânea",
     [UI_MENU_FPS_DISPLAY] = "Taxa do monitor", [UI_MENU_FPS_DISPLAY_HZ] = "Taxa do monitor (%.0f Hz)",
     [UI_MENU_FPS_UNLIMITED] = "Sem limite",
     [UI_MENU_FPS_RTSS] = "limitado pelo RivaTuner Statistics Server",
     [UI_MENU_FPS_RTSS_READONLY] = "o RivaTuner pede o jogo como administrador",
     [UI_MENU_FPS_RTSS_IGNORED] = "o RivaTuner não limita este jogo; o jogo limita",
+    [UI_MENU_FPS_RTSS_TWO] = "o limite do próprio RivaTuner também vale: dois limitadores",
     [UI_MENU_REALTIME] = "Velocidade do jogo pelo relógio",
     [UI_MENU_REALTIME_DESC] = "Avança o jogo pelo tempo real, para que um quadro lento não deixe o jogo mais lento.",
     [UI_MENU_CLOTH_REALTIME] = "Tecidos pelo relógio",
@@ -1331,6 +1422,10 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "Valores menores reforçam a vibração fraca.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Vibração dos gatilhos (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Também vibra os gatilhos do controle Xbox.",
+    [UI_MENU_RUMBLE_HD] = "Vibração HD (Switch)",
+    [UI_MENU_RUMBLE_HD_DESC] = "Envia a vibração detalhada do jogo a um Pro Controller do Switch ou Joy-Con como ela "
+                               "é. A intensidade da vibração continua valendo: o valor padrão é a do jogo.",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "Requer um Pro Controller do Switch ou Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "Layout dos botões",
     [UI_MENU_PAD_LAYOUT_DESC] = "Define qual botão funciona como A. Nintendo: pela posição, A à direita, B embaixo, "
                                 "X em cima, Y à esquerda. Xbox e PlayStation: pela letra, A embaixo, B à direita, X à "
@@ -1438,11 +1533,6 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_AMIIBO_STATUS] = "Estado: %s",
     [UI_MENU_MENU_LANG] = "Idioma do menu", [UI_MENU_MENU_LANG_DESC] = "Idioma deste menu e do indicador.",
     [UI_MENU_MENU_LANG_AUTO] = "Automático (do Windows)",
-    [UI_MENU_LOW_END_GPU] = "Modo para GPUs fracas (experimental)",
-    [UI_MENU_LOW_END_GPU_DESC] = "Para placas de vídeo antigas ou com pouca memória de vídeo. Executa os mesh shaders do jogo como compute "
-                                 "shaders onde a placa não os tem, mantém a memória de vídeo dentro do que o driver informa como livre, espera "
-                                 "menos pela GPU e prepara os quadros numa thread própria. Medido apenas numa Radeon RX 580: pode mostrar um "
-                                 "quadro escuro ou piscando de vez em quando, então deixe desligado numa placa mais nova.",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
     [UI_MENU_DISCORD_RPC_DESC] = "Mostra \"Jogando NX2navi\" com o tempo de jogo no seu status do Discord "
                                  "enquanto o jogo roda. discord_app_id e discord_image no nx2navi.ini escolhem a "
@@ -1597,6 +1687,44 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "Brilho do branco no jogo, em nits.",
     [UI_MENU_HDR_UI] = "Brilho do HUD e do menu",
     [UI_MENU_HDR_UI_DESC] = "Brilho da interface e deste menu, em nits.",
+    [UI_MENU_HDR_HUE] = "Correção de matiz",
+    [UI_MENU_HDR_HUE_DESC] = "Quanto as cores brilhantes mantêm o matiz que tinham antes da curva de tons; 0 deixa que "
+                             "mudem com a curva.",
+    [UI_MENU_HDR_GAMMA] = "Correção de gama",
+    [UI_MENU_HDR_GAMMA_DESC] = "Mostra a imagem como uma tela de gama 2.2 ou BT.1886 (2.4) mostraria, como o jogo foi "
+                               "feito para ser visto; Desligado mantém a curva sRGB, com sombras mais claras.",
+    [UI_MENU_HDR_TONEMAP] = "Curva de tons",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: a curva do próprio jogo, com brilho SDR. PsychoV35: a cena por um modelo da "
+                                 "resposta do olho, ajustada ao cinza médio e ao tom do jogo, até o pico da sua tela. "
+                                 "RenoDRT: o visual SDR do jogo levado até o pico pelo brilho.",
+    [UI_MENU_HDR_EXPOSURE] = "Exposição",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "Brilho de toda a imagem antes da curva de tons; 100 % a deixa como está.",
+    [UI_MENU_HDR_HIGHLIGHTS] = "Realces",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Brilho das partes claras; 50 as deixa como estão.",
+    [UI_MENU_HDR_SHADOWS] = "Sombras",
+    [UI_MENU_HDR_SHADOWS_DESC] = "Brilho das partes escuras; 50 as deixa como estão.",
+    [UI_MENU_HDR_CONTRAST] = "Contraste",
+    [UI_MENU_HDR_CONTRAST_DESC] = "Contraste em torno do cinza médio; 50 o deixa como está.",
+    [UI_MENU_HDR_SATURATION] = "Saturação",
+    [UI_MENU_HDR_SATURATION_DESC] = "Força de todas as cores; 50 a deixa como está.",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Saturação dos realces",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Força das cores das partes mais claras; 50 a deixa como está.",
+    [UI_MENU_HDR_BLOWOUT] = "Estouro",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "Leva as partes mais claras para o branco; 0 mantém a cor delas.",
+    [UI_MENU_HDR_FLARE] = "Flare",
+    [UI_MENU_HDR_FLARE_DESC] = "Ergue as partes mais escuras como um pouco de luz difusa faria; 0 mantém o preto preto.",
+    [UI_MENU_HDR_GRADE] = "Gradação de cor",
+    [UI_MENU_HDR_GRADE_DESC] = "Quanto da gradação de cor do próprio jogo a imagem HDR mantém; 0 é a cena sem ela.",
+    [UI_MENU_HDR_MIDGRAY] = "Cinza médio",
+    [UI_MENU_HDR_MIDGRAY_DESC] = "Onde fica o cinza médio da cena. Vanilla: onde a curva do próprio jogo o coloca. "
+                                 "Render: no valor da cena, um pouco mais escuro.",
+    [UI_MENU_HDR_MATCH_SLOPE] = "Igualar inclinação do tom",
+    [UI_MENU_HDR_MATCH_SLOPE_DESC] = "Dá aos tons médios o contraste da curva do próprio jogo.",
+    [UI_MENU_HDR_TONE_SLOPE] = "Inclinação do tom",
+    [UI_MENU_HDR_TONE_SLOPE_DESC] = "Inclinação da curva de tons no cinza médio; 50 a deixa como está.",
+    [UI_MENU_HDR_HUE_CLIP] = "Emulação do corte de matiz",
+    [UI_MENU_HDR_HUE_CLIP_DESC] = "Quanto as cores brilhantes viram como onde a imagem SDR do jogo estoura: o fogo "
+                                  "para o amarelo e o branco. 0 mantém o matiz delas.",
     [UI_MENU_PROMPTS] = "Ícones de botões",
     [UI_MENU_PROMPTS_DESC] = "Quais botões os ícones do jogo mostram: no texto, no ícone de ação e nas notas da "
                              "ocarina. Nintendo: os do próprio jogo. Xbox e PlayStation: os botões desse controle (LB, "
@@ -1753,6 +1881,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_CAPTURE_FAILED] = "Não foi possível salvar a captura de bug %d",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
+    [UI_BOOT_COMPUTE] = "Pipelines de computação: %lld de %lld", [UI_BOOT_DRIVER_CACHE] = "Cache do driver: %lld de %lld",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Alguns cheats alteram o código do jogo e ainda não foram compilados nele: são "
                                     "novos ou editados, ou a última recompilação falhou ou foi cancelada. Fecha o "
@@ -1825,6 +1954,18 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT_VSYNC] = "垂直同步",
     [UI_MENU_PRESENT_IMMEDIATE] = "立即",
     [UI_MENU_PRESENT_IN_USE] = "使用中：%s",
+    [UI_MENU_LOW_LATENCY] = "低延迟",
+    [UI_MENU_LOW_LATENCY_DESC] = "显卡驱动推迟每一帧的开始，尽可能晚地读取手柄输入（NVIDIA Reflex、AMD Anti-Lag），"
+                                 "并由它保持帧率上限。增强让显卡保持最高频率。",
+    [UI_MENU_LOW_LATENCY_BOOST] = "开启 + 增强",
+    [UI_MENU_LOW_LATENCY_NO_DRIVER] = "此显卡驱动没有低延迟模式",
+    [UI_MENU_LOW_LATENCY_DLSSG] = "DLSS 帧生成使用自带的低延迟",
+    [UI_MENU_LOW_LATENCY_FG] = "此显卡运行帧生成时关闭",
+    [UI_MENU_FRAMEGEN_DESC_ANY] = "添加生成的帧，使动作更流畅，可搭配 Upscaling 中的任意选项。",
+    [UI_MENU_FRAMEGEN_DESC_NGX] = "添加生成的帧，使动作更流畅。NVIDIA DLSS 需要在游戏启动时于 Upscaling 中选择 DLSS "
+                                  "模式；之后可搭配 Upscaling 中的任意选项。",
+    [UI_MENU_FRAMEGEN_NOTE_NGX] = "需要在游戏启动时开启 DLSS",
+    [UI_MENU_LOW_LATENCY_FAILED] = "使用中：关闭，驱动拒绝了（见日志中的 lowlat）",
     [UI_MENU_GPU] = "显卡",
     [UI_MENU_GPU_DESC] = "运行游戏所用的显卡。",
     [UI_MENU_GPU_AUTO] = "自动",
@@ -1847,6 +1988,14 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
                               "窗口更小时（Ocarina 绘制 2560 × 1440）：画面被缩小，FSR 按下方强度锐化。",
     [UI_MENU_UPSCALER_FSR] = "AMD FSR 1",
     [UI_MENU_UPSCALER_BILINEAR] = "双线性",
+    [UI_MENU_UPSCALING_NATIVE] = "原生（100%）",
+    [UI_MENU_UPSCALING_DESC] = "画面如何平滑并缩放到窗口。原生：以画面的完整尺寸绘制 3D 场景，不使用超分辨率："
+                               "最清晰，GPU 负担也最大。",
+    [UI_MENU_UPSCALING_DESC_FSR] = "画面如何平滑并缩放到窗口。原生：以画面的完整尺寸绘制 3D 场景，不使用超分辨率："
+                                   "最清晰，GPU 负担也最大。",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "画面如何平滑并缩放到窗口。原生：以画面的完整尺寸绘制 3D 场景，不使用超分辨率："
+                                      "最清晰，GPU 负担也最大。此处不提供 AMD FSR 3.1：它需要 "
+                                      "amd_fidelityfx_vk.dll，但无法加载。",
     [UI_MENU_GAME_ASPECT] = "宽屏",
     [UI_MENU_GAME_ASPECT_DESC] = "扩大视野。界面和菜单保持 16:9。",
     [UI_MENU_GAME_ASPECT_16_9] = "16:9（游戏原生）", [UI_MENU_GAME_ASPECT_WINDOW] = "窗口比例",
@@ -1888,6 +2037,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_FPS_RTSS] = "由 RivaTuner Statistics Server 限制",
     [UI_MENU_FPS_RTSS_READONLY] = "RivaTuner 需要以管理员身份运行游戏",
     [UI_MENU_FPS_RTSS_IGNORED] = "RivaTuner 未限制本游戏；由游戏自行限制",
+    [UI_MENU_FPS_RTSS_TWO] = "RivaTuner 自身的限制也在生效：两个限制器",
     [UI_MENU_REALTIME] = "游戏速度跟随时钟",
     [UI_MENU_REALTIME_DESC] = "按真实时间推进游戏，帧率低时游戏速度也不会变慢。",
     [UI_MENU_CLOTH_REALTIME] = "布料跟随时钟",
@@ -1904,6 +2054,11 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_MODE_HANDHELD] = "掌机模式",
     [UI_MENU_ASSUME_FOCUS] = "后台保持运行",
     [UI_MENU_ASSUME_FOCUS_DESC] = "切换到其他窗口时游戏继续运行。",
+    [UI_MENU_TEXT_SPEED] = "文字速度",
+    [UI_MENU_TEXT_SPEED_DESC] = "游戏对话框显示文字的速度。快速为三倍速度；即时则每页立即全部显示。"
+                                "游戏不允许加快的文字（例如与过场动画或语音同步的台词）保持原速。",
+    [UI_MENU_TEXT_SPEED_NORMAL] = "正常", [UI_MENU_TEXT_SPEED_FAST] = "快速",
+    [UI_MENU_TEXT_SPEED_INSTANT] = "即时",
     [UI_MENU_VOLUME] = "音量",
     [UI_MENU_MENU_SOUNDS] = "菜单音效", [UI_MENU_MENU_SOUNDS_DESC] = "本菜单的音效音量。",
     [UI_MENU_VOLUME_DESC] = "游戏总音量。",
@@ -1915,6 +2070,9 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_CURVE_DESC] = "数值越低，轻微震动越强。",
     [UI_MENU_RUMBLE_TRIGGERS] = "扳机振动（Xbox）",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "同时震动 Xbox 手柄的扳机。",
+    [UI_MENU_RUMBLE_HD] = "HD 振动（Switch）",
+    [UI_MENU_RUMBLE_HD_DESC] = "将游戏的细腻振动原样发送到 Switch Pro 手柄或 Joy-Con。振动强度仍然有效：默认值即游戏原本的强度。",
+    [UI_MENU_RUMBLE_HD_NEEDS] = "需要 Switch Pro 手柄或 Joy-Con",
     [UI_MENU_PAD_LAYOUT] = "按键布局",
     [UI_MENU_PAD_LAYOUT_DESC] = "设置哪个按键作为 A 键。Nintendo：按位置，A 在右、B 在下、X 在上、Y 在左。Xbox 和 PlayStation："
                                 "按标注，A 在下、B 在右、X 在左、Y 在上（PlayStation 手柄上为叉、圆圈、方块和三角）。自动："
@@ -2075,10 +2233,6 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_MENU_LANG] = "菜单语言",
     [UI_MENU_MENU_LANG_DESC] = "本菜单和性能浮层的语言。",
     [UI_MENU_MENU_LANG_AUTO] = "自动（跟随 Windows）",
-    [UI_MENU_LOW_END_GPU] = "低端显卡模式（实验性）",
-    [UI_MENU_LOW_END_GPU_DESC] = "适用于较旧的显卡和显存不足的显卡。在显卡不支持网格着色器时以计算着色器运行游戏的网格着色器，"
-                                 "将显存占用控制在驱动报告的可用范围内，减少等待 GPU 的时间，并在独立线程上准备帧。"
-                                 "仅在 Radeon RX 580 上测试过：偶尔可能出现变暗或闪烁的画面，较新的显卡请保持关闭。",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
     [UI_MENU_DISCORD_RPC_DESC] = "游戏运行时在 Discord 状态中显示“正在玩 NX2navi”及游戏时长。nx2navi.ini 中的 "
                                  "discord_app_id 和 discord_image 选择应用。",
@@ -2255,6 +2409,38 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "游戏中白色的亮度（尼特）。",
     [UI_MENU_HDR_UI] = "HUD 和菜单亮度",
     [UI_MENU_HDR_UI_DESC] = "界面和本菜单的亮度（尼特）。",
+    [UI_MENU_HDR_HUE] = "色调校正",
+    [UI_MENU_HDR_HUE_DESC] = "明亮色彩保留色调映射前色调的程度；0 让它们随曲线偏移。",
+    [UI_MENU_HDR_GAMMA] = "伽马校正",
+    [UI_MENU_HDR_GAMMA_DESC] = "按游戏设计时的观看方式，以 2.2 或 BT.1886（2.4）显示器的效果呈现画面；关闭则保留 sRGB 曲线，暗部更亮。",
+    [UI_MENU_HDR_TONEMAP] = "色调映射",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla：游戏自身的曲线，SDR 亮度。PsychoV35：场景经过人眼响应模型，与游戏的中灰和影调对齐，直到显示器的峰值亮度。RenoDRT：按亮度把游戏的 SDR 观感延伸到峰值。",
+    [UI_MENU_HDR_EXPOSURE] = "曝光",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "色调映射前整个画面的亮度；100 % 保持不变。",
+    [UI_MENU_HDR_HIGHLIGHTS] = "高光",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "明亮部分的亮度；50 保持不变。",
+    [UI_MENU_HDR_SHADOWS] = "阴影",
+    [UI_MENU_HDR_SHADOWS_DESC] = "暗部的亮度；50 保持不变。",
+    [UI_MENU_HDR_CONTRAST] = "对比度",
+    [UI_MENU_HDR_CONTRAST_DESC] = "中灰周围的对比度；50 保持不变。",
+    [UI_MENU_HDR_SATURATION] = "饱和度",
+    [UI_MENU_HDR_SATURATION_DESC] = "所有色彩的强度；50 保持不变。",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "高光饱和度",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "最亮部分的色彩强度；50 保持不变。",
+    [UI_MENU_HDR_BLOWOUT] = "过曝",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "让最亮的部分趋向白色；0 保留其颜色。",
+    [UI_MENU_HDR_FLARE] = "眩光",
+    [UI_MENU_HDR_FLARE_DESC] = "像少量杂散光一样提亮最暗的部分；0 保持纯黑。",
+    [UI_MENU_HDR_GRADE] = "调色",
+    [UI_MENU_HDR_GRADE_DESC] = "HDR 画面保留游戏自身调色的程度；0 为不含调色的场景。",
+    [UI_MENU_HDR_MIDGRAY] = "中灰",
+    [UI_MENU_HDR_MIDGRAY_DESC] = "场景中灰落在哪里。Vanilla：游戏自身曲线给出的位置。Render：场景的原值，稍暗。",
+    [UI_MENU_HDR_MATCH_SLOPE] = "匹配影调斜率",
+    [UI_MENU_HDR_MATCH_SLOPE_DESC] = "让中间调具有游戏自身曲线的对比度。",
+    [UI_MENU_HDR_TONE_SLOPE] = "影调斜率",
+    [UI_MENU_HDR_TONE_SLOPE_DESC] = "影调曲线在中灰处的陡峭程度；50 保持不变。",
+    [UI_MENU_HDR_HUE_CLIP] = "色调裁切模拟",
+    [UI_MENU_HDR_HUE_CLIP_DESC] = "明亮色彩像游戏 SDR 画面裁切处那样偏转的程度：火焰偏向黄色和白色。0 保持其色调。",
     [UI_MENU_PROMPTS] = "按键提示",
     [UI_MENU_PROMPTS_DESC] = "游戏的按键提示显示哪种按键：包括文字、动作提示和陶笛的音符。Nintendo：游戏原有的提示。"
                              "Xbox 和 PlayStation：该手柄的按键（LB、RB、LT、RT、Menu、View；L1、R1、L2、R2、Options、Create），"
@@ -2388,6 +2574,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_CAPTURE_FAILED] = "错误快照 %d 无法保存",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
+    [UI_BOOT_COMPUTE] = "计算管线：%lld / %lld", [UI_BOOT_DRIVER_CACHE] = "驱动缓存：%lld / %lld",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",
     [UI_MENU_CHEATS_REBUILD_DESC] = "有些金手指会修改游戏代码，但尚未构建进游戏：它们是新增或修改的，或上次重新构建失败或被取消。将关闭游戏；安装程序会把它们构建进去（几分钟）并重新启动游戏。上次存档之后的进度会丢失。",
     [UI_MENU_MODS_EXEFS_UNSUPPORTED] = "此模组修改游戏代码（exefs）的方式本移植无法应用，因此整个模组保持关闭。%s",

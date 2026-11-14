@@ -18,9 +18,12 @@
 #include "audren.h"
 #include "cfg.h"
 #include "flight.h"
+#include "flight_flash.h"
 #include "fs.h"
 #include "gfx.h"
 #include "gfx_wsys.h"
+#include "input.h"
+#include "logq.h"
 #include "nvn_api.h"
 #include "ov.h"
 #include "platform/platform.h"
@@ -29,6 +32,7 @@
 #include "vk_fg.h"
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
+#include "vk_lowlat.h"
 
 #define FRAMES 2
 #define MAX_IMAGES 16
@@ -39,14 +43,42 @@
 // ---- queue lock
 // Taking it hands the replay's held submissions to the queue first (vk_sync.c, submit batching), so whatever the
 // holder submits or waits for comes after them in queue order.
+// NX2NAVI_LOCK_TIME also names who holds it: a hold of QL_HOLD_NS or more goes into the frame-time summary under the
+// site that took the lock (perf.c perf_qlock_hold), beside the waits for it. A present had waited 48 ms for the lock
+// with no holder named anywhere. The taking functions are not inlined, so that their return address is the caller's
+// site, which is also the site the waits are reported under (plat_rmutex_lock_at). ql_site and ql_t0 are written by
+// the holder only, at the outermost take and release.
+#define QL_HOLD_NS 5000000ull
 static PlatRMutex g_ql;
-void vk_queue_lock(void) {
-    plat_rmutex_lock(&g_ql);
+static void *ql_site;
+static uint64_t ql_t0;
+static void ql_taken(void *site) {
+    if (g_ql.depth == 1 && perf_lock_holds_on()) ql_t0 = plat_now_ns(), ql_site = site;
+}
+__attribute__((noinline)) void vk_queue_lock(void) {
+    void *site = __builtin_return_address(0);
+    plat_rmutex_lock_at(&g_ql, site);
+    ql_taken(site);
     vk_sync_flush_held();
 }
-void vk_queue_lock_raw(void) { plat_rmutex_lock(&g_ql); }
-int vk_queue_trylock_raw(void) { return plat_rmutex_trylock(&g_ql); }
-void vk_queue_unlock(void) { plat_rmutex_unlock(&g_ql); }
+__attribute__((noinline)) void vk_queue_lock_raw(void) {
+    void *site = __builtin_return_address(0);
+    plat_rmutex_lock_at(&g_ql, site);
+    ql_taken(site);
+}
+__attribute__((noinline)) int vk_queue_trylock_raw(void) {
+    if (!plat_rmutex_trylock(&g_ql)) return 0;
+    ql_taken(__builtin_return_address(0));
+    return 1;
+}
+void vk_queue_unlock(void) {
+    if (g_ql.depth == 1 && ql_t0) {
+        uint64_t d = plat_now_ns() - ql_t0;
+        ql_t0 = 0;
+        if (d >= QL_HOLD_NS) perf_qlock_hold(ql_site, d);
+    }
+    plat_rmutex_unlock(&g_ql);
+}
 
 // ---- window state shared with the back end
 static VkSurfaceKHR g_surface;
@@ -72,6 +104,56 @@ void gfx_window_focus_changed(int in) {
     plat_local_time(&t);
     rt_log("gfx: window %s the focus at %04d-%02d-%02d %02d:%02d:%02d local time", in ? "gained" : "lost",
            t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    if (!in) {   // the session's reports and the log now, should the process be ended from outside next
+        perf_focus_lost();     // perf.c
+        rt_log_focus_lost();   // main.c
+    }
+}
+
+// ---- the orderly end: the window's close (gfx_window_closed), the guest's ExitProcess (svc.c) and the end of a
+// --seconds run (boot.c rt_frame_presented)
+// Once per process, whichever comes first. The window's close and the console's (main.c console_closed) can come
+// together, or the guest's ExitProcess beside either: each ran its own sequence, so two pipeline saves and two
+// frame-time summaries were written while both raced. 1 for the first caller; a caller on another thread waits here
+// for good while the first ends the process; 0 for the first caller's own thread coming back, which goes on with the
+// sequence it is in. The window's close runs on a thread of its own (gfx_window_win.c exit_start); the window thread
+// runs the sequence itself, and may handle a message inside it, only when that thread could not be made.
+static volatile uint32_t exit_tid;   // the thread that runs the orderly end, 0 before one started
+
+int rt_exit_begin(void) {
+    uint32_t me = plat_thread_id(), was = 0;
+    if (__atomic_compare_exchange_n(&exit_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        rt_log_ending();   // the end's lines reach the log file past its cap (main.c log_sink)
+        return 1;
+    }
+    if (was == me) return 0;
+    for (;;) plat_sleep_ms(1000);
+}
+
+int rt_exit_started(void) { return __atomic_load_n(&exit_tid, __ATOMIC_ACQUIRE) != 0; }
+
+// What every orderly end saves and puts back, in this order. What a kill of the process must not lose and what is quick
+// comes first: Windows ends a closed console about 5 s after the close, a session's end and an "End task" sooner, and
+// the pipeline save alone can take that long (vk_pipeline_save_exit waits up to 5 s for the builds that run). So a
+// Commit in flight is finished, RivaTuner Statistics Server's profile and the controller's rumble are put back, the
+// settings, the boot prebuild's marker, the frame-time summary and the memory ranking are written, and the log reaches
+// the disk before the pipeline save starts. The final save flush comes last: the game's threads run until plat_exit,
+// and a Commit the game starts during the pipeline save is still taken and waited for. RT_EXIT_SETTINGS: nx2navi.ini
+// gets the menu's changes (not in a scripted --seconds run, whose end is no player's).
+void rt_exit_steps(unsigned what) {
+    fs_save_wait();   // a Commit already under way: finished, nothing refused
+    // the game's frame limit out of the profile; rtss_limit.c keeps it out while frames go on during the pipeline save
+    rtss_limit_restore();
+    input_rumble_hd_stop();   // a controller on HD rumble gets the neutral value: nothing renews or stops it after the exit
+    if (what & RT_EXIT_SETTINGS) cfg_save();   // a menu change saves 400 ms later on the render thread (option_rows.cpp)
+    // The game ended while the boot still built its pipelines: not the driver crash the marker is there to catch. Left
+    // in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
+    vk_pipeline_prewarm_marker_clear();
+    prof_write();   // "frametime: exit" and the stutter map; plat_exit runs no atexit handlers
+    vk_mem_exit_log();   // the memory report's ranking of the session
+    logq_flush();   // the lines so far on the disk before the slow part; the queue stays on
+    vk_pipeline_save_exit();
+    fs_save_flush();   // last: a Commit started since fs_save_wait finishes, and one after this is refused
 }
 
 // The window was closed: the process ends with it, once a save Commit still running in the background is
@@ -79,16 +161,10 @@ void gfx_window_focus_changed(int in) {
 // (plat_restart), and the new process waits until this one is gone (main.c) before it moves the log and opens the
 // RomFS and the saves.
 void gfx_window_closed(void) {
+    if (!rt_exit_begin()) return;
     int restart = plat_cas32(&g_restart, 0, 0) != 0;
     rt_log("gfx: window closed; %s", restart ? "restarting" : "exiting");
-    cfg_save();   // a menu change saves 400 ms later on the render thread (option_rows.cpp); closing sooner kept the old file
-    // The window closed while the boot still built its pipelines: not the driver crash the marker is there to catch.
-    // Left in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
-    vk_pipeline_prewarm_marker_clear();
-    vk_pipeline_save_exit();
-    prof_write();   // plat_exit runs no atexit handlers
-    rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
-    fs_save_flush();   // last: the game's threads still run until plat_exit, and a Commit after this one is refused
+    rt_exit_steps(RT_EXIT_SETTINGS);
     if (restart) {
         cfg_setenv("NX2NAVI_REEXEC", NULL);   // the new process counts its own address-space retries (memory.c)
         if (!plat_restart()) rt_log("gfx: the restart could not start the game again");
@@ -107,8 +183,10 @@ int gfx_cfg_fullscreen(void) { return cfg_bool("NX2NAVI_FULLSCREEN"); }
 
 void gfx_cfg_window_size(int *w, int *h) {
     int x = 0, y = 0;
-    if (sscanf(cfg_value("NX2NAVI_WINDOW_SIZE"), "%dx%d", &x, &y) != 2 || x < 640 || y < 360 || x > 7680 || y > 4320)
-        sscanf(cfg_meta("WINDOW_SIZE")->def, "%dx%d", &x, &y);   // unparsable or out of range: the default
+    if (sscanf(cfg_value("NX2NAVI_WINDOW_SIZE"), "%dx%d", &x, &y) != 2 || x < 640 || y < 360 || x > 7680 || y > 4320) {
+        const CfgMeta *m = cfg_meta("WINDOW_SIZE");   // unparsable or out of range: the default
+        if (!m || sscanf(m->def, "%dx%d", &x, &y) != 2) x = 1920, y = 1080;
+    }
     *w = x;
     *h = y;
 }
@@ -184,6 +262,7 @@ static VkDeviceSize g_cap_size;
 static int g_cap_w, g_cap_h, g_cap_valid;
 static int g_flip_on;            // vk_present_blit submitted the blit of swapchain image g_flip_idx; vk_present_flip presents it
 static uint32_t g_flip_idx;
+static uint64_t g_flip_frame;    // ... of this game frame, when a driver's low latency follows it (vk_lowlat.c); else 0
 
 // ---- NX2NAVI_FLIGHT thumbnails (flight.c; g_pl): each present also blits the swapchain image down into slot frame % g_th_n
 // of a host-visible ring. A slot's tag names the frame it holds complete; recording a new frame clears the tag first,
@@ -250,15 +329,29 @@ static void vsync_ensure(void) {
     plat_rmutex_unlock(&g_start_lock);
 }
 
+// Lists a vsync event the vsync thread signals. With the list full, an event the game destroyed since
+// (kern_system_event_live 0: its state byte is 0 or its memory is gone) gives its slot, which also stops the vsync
+// thread signalling it; the list ends the process only when all 16 are live. Each new listing is logged, so a long
+// session's log shows how often the game asks for a vsync event at a new address.
 void gfx_vsync_bind(uint64_t system_event) {
     plat_mutex_lock(&g_vs_lock);
     int have = 0;
     for (int i = 0; i < g_vs_nev; i++) have |= g_vs_ev[i] == system_event;
+    int slot = g_vs_nev;
     if (!have) {
-        if (g_vs_nev == 16) rt_fatal("gfx: more than 16 vsync events");
-        g_vs_ev[g_vs_nev++] = system_event;
+        if (slot == 16) {
+            slot = 0;
+            while (slot < 16 && kern_system_event_live(g_vs_ev[slot])) slot++;
+            if (slot == 16) rt_fatal("gfx: more than 16 live vsync events");
+        } else {
+            g_vs_nev++;
+        }
+        g_vs_ev[slot] = system_event;
     }
+    int listed = g_vs_nev;
     plat_mutex_unlock(&g_vs_lock);
+    if (!have)
+        rt_log("gfx: vsync event %#llx bound in slot %d, %d listed", (unsigned long long)system_event, slot, listed);
     vsync_ensure();
 }
 
@@ -280,23 +373,30 @@ unsigned gfx_window_focus_messages(void) { return (unsigned)g_focus_msgs; }
 // Present path (g_pl held): a settings change (cfg_version) reaches the window thread, which applies a changed size or
 // fullscreen; a changed NX2NAVI_VK_PRESENT or NX2NAVI_HDR rebuilds the swapchain at this present.
 static int g_sc_hdr_wanted;   // vk_hdr_wanted when the swapchain was made (create_swapchain)
+static int g_sc_ll_wanted;    // vk_lowlat_swapchain_wanted then
 static void window_settings_live(void) {
     static unsigned seen;
     static int started;
     static char present[16];   // the NX2NAVI_VK_PRESENT the swapchain was made with
     unsigned v = cfg_version();
+    // Frame generation that failed (vk_fg.cpp fail makes vk_fg_wanted 0 with no setting changed): its swapchain and
+    // both contexts go at the next present, not when some other setting moves. Only this way round at every present: a
+    // frame generation swapchain wanted and not made is tried again at a settings change, not at every frame.
+    if (started && vk_fg_active() && !vk_fg_wanted()) plat_xchg32(&g_dirty, 1);
     if (started && v == seen) return;
     seen = v;
     res_fov_live();
+    if (started && vk_fg_wanted() != vk_fg_active()) plat_xchg32(&g_dirty, 1);   // frame generation switched: its own swapchain
     const char *e = cfg_value("NX2NAVI_VK_PRESENT");
     if (!started || strncmp(e, present, sizeof present - 1)) {
         snprintf(present, sizeof present, "%s", e);
         if (started) plat_xchg32(&g_dirty, 1);
     }
-    if (started && vk_fg_wanted() != vk_fg_active()) plat_xchg32(&g_dirty, 1);   // frame generation switched: its own swapchain
     // HDR switched in the menu: a swapchain of the other format. Compared with what the swapchain was made for, not
     // with what it got: on a display without HDR10 the setting stays on and the swapchain SDR, and that is settled.
     if (started && vk_hdr_wanted() != g_sc_hdr_wanted) plat_xchg32(&g_dirty, 1);
+    // NVIDIA's low latency switched in the menu (vk_lowlat.c): its mode is asked for when the swapchain is made
+    if (started && vk_lowlat_swapchain_wanted() != g_sc_ll_wanted) plat_xchg32(&g_dirty, 1);
     ov_operation_mode_live();
     audio_channels_live();
     if (started) gfx_window_apply_settings();
@@ -339,6 +439,12 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
 
 const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_got, __ATOMIC_ACQUIRE); }
 
+// kern_now_ns when the newest host present returned with its picture taken (flip_locked); 0 before the first. A
+// minimised window and a frame hold present nothing, so it ages: RTSS, which holds the frames inside the host present,
+// then holds none, and the game's pacer takes the limit back (rtss_decide.h rtss_pace_period).
+static uint64_t g_hosted_ns;
+uint64_t gfx_window_hosted_ns(void) { return __atomic_load_n(&g_hosted_ns, __ATOMIC_ACQUIRE); }
+
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.
 static void flip_locked(void) {
@@ -348,10 +454,18 @@ static void flip_locked(void) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_render_done[g_flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
                            .pImageIndices = &g_flip_idx};
+    // A driver's low latency (vk_lowlat.c): its present stage or marker right before the present of a game frame it
+    // follows, the frame's number on the present where the plain swapchain takes one, and the end marker after it.
+    // Nothing for any other present (the boot screen, a frame the mode did not start, the mode off).
+    VkLowlatPresent ll;
     vk_queue_lock();
+    pi.pNext = vk_lowlat_present_begin(g_flip_frame, &ll);
+    g_flip_frame = 0;
     VkResult r = vk_dlssg_active() ? vk_dlssg_present(vk_ctx()->gfx_queue, &pi)
                : vk_fg_active()    ? vk_fg_present(&pi) : vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
+    vk_lowlat_present_end(&ll);
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) __atomic_store_n(&g_hosted_ns, kern_now_ns(), __ATOMIC_RELEASE);
     vk_device_lost_check(r, "the present");
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }
@@ -411,6 +525,7 @@ static int create_swapchain(void) {
     VkSurfaceFormatKHR sf = fmts[0];
     g_sc_hdr_wanted = vk_hdr_wanted();
     int hdr = g_sc_hdr_wanted && vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
+    if (!hdr) vk_hdr_images_release();   // HDR off, or not on this display: what its encode made goes
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
@@ -422,8 +537,14 @@ static int create_swapchain(void) {
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > most) count = most;
 
+    // A rebuild holds the queue lock across the device's idle wait and the create, and every submission waits behind
+    // it: the made swapchain's line says how long (the first 16 and each doubling of the count).
+    const uint64_t t_ask = plat_now_ns();
     vk_queue_lock();
+    const uint64_t t_held = plat_now_ns();
     vkDeviceWaitIdle(c->device);
+    const uint64_t t_idle = plat_now_ns();
+    vk_lowlat_swapchain(VK_NULL_HANDLE, 0);   // NVIDIA's low-latency calls name the swapchain: none while it is replaced
     VkSwapchainKHR old = g_sc;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = count,
@@ -460,8 +581,22 @@ static int create_swapchain(void) {
             return 0;
         }
     }
+    // NVIDIA's low latency (vk_lowlat.c): the plain swapchain is made with the latency mode while the setting is on,
+    // the only structure in its chain. A frame generation's swapchain above is not: the calls cannot name it.
+    const VkSwapchainLatencyCreateInfoNV lat = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV,
+                                                .latencyModeEnable = VK_TRUE};
+    int ll_sc = 0;
+    g_sc_ll_wanted = vk_lowlat_swapchain_wanted();
     if (r != VK_SUCCESS && vk_dlssg_active()) r = vk_dlssg_create_swapchain(c->device, &ci, &g_sc);   // Streamline's hook
-    else if (r != VK_SUCCESS) r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
+    else if (r != VK_SUCCESS) {
+        if (g_sc_ll_wanted) ci.pNext = &lat, ll_sc = 1;
+        r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
+    }
+    {   // three creates in a row that fail with the latency mode asked for: the next is made without it
+        static int ll_failed;
+        ll_failed = r != VK_SUCCESS && ll_sc ? ll_failed + 1 : 0;
+        if (ll_failed >= 3) vk_lowlat_swapchain_refused((int)r);
+    }
     if (r != VK_SUCCESS) {
         static volatile int32_t n_failed;
         int32_t nf_log = plat_inc32(&n_failed);
@@ -487,6 +622,7 @@ static int create_swapchain(void) {
     vk_hdr_set_active(hdr);
     if (hdr) vk_hdr_metadata(g_sc, 1);
     g_sc_ext = ext;
+    vk_lowlat_swapchain(ll_sc ? g_sc : VK_NULL_HANDLE, 1);   // the sleep mode is set on it; none: not one for that path
     g_sc_n = MAX_IMAGES;
     if (vk_fg_active()) {   // AMD's swapchain: the count first (a larger capacity is not cut down to it)
         uint32_t n = 0;
@@ -513,6 +649,15 @@ static int create_swapchain(void) {
         if (vkCreateImageView(c->device, &vi, NULL, &g_sc_view[i]) != VK_SUCCESS) g_sc_view[i] = VK_NULL_HANDLE;
     }
     free_capture();
+    {
+        static uint32_t n_made;
+        const uint64_t t_end = plat_now_ns();
+        if (++n_made <= 16 || !(n_made & (n_made - 1)))
+            rt_log("gfx: swapchain %ux%u made in %.1f ms: %.1f ms waiting for the queue lock, then the lock held "
+                   "%.1f ms (%.1f ms of it waiting for the device to idle); %u made so far", ext.width, ext.height,
+                   (t_end - t_ask) / 1e6, (t_held - t_ask) / 1e6, (t_end - t_held) / 1e6, (t_idle - t_held) / 1e6,
+                   n_made);
+    }
     vk_queue_unlock();
     return 1;
 }
@@ -653,6 +798,30 @@ int vk_thumbs_read(uint64_t frame, uint8_t *rgba) {
             rgba[i] = rgba[i + 2], rgba[i + 2] = t;
         }
     return ok != 0;
+}
+
+// The flight recorder's flash trigger (flight.c flight_cells) gets the cell means of frame's thumbnail, which has just
+// completed in its ring slot (g_pl held). flash_cells reads a quarter of the slot's pixels, about 15 us measured on
+// ordinary memory (tests/flight_flash_check.py time); the ring is mapped host memory allocated for random access
+// (ensure_thumbs), which is cached memory where the device has it, as vk_thumbs_read's copy of a whole slot relies on.
+static void thumb_cells(uint64_t frame) {
+    unsigned ring = (unsigned)(frame % (uint64_t)g_th_n);
+    uint8_t cells[FLASH_CELLS];
+    vmaInvalidateAllocation(vk_ctx()->vma, g_th_alloc, TH_BYTES * ring, TH_BYTES);
+    flash_cells(g_th_ptr + TH_BYTES * ring, FLIGHT_THUMB_W, FLIGHT_THUMB_H, cells);
+    flight_cells(frame, cells);
+}
+
+// The memory report's swapchain (vk_memory.c outside_log): its images and their size; the bytes are the pixels alone,
+// 8 a pixel for a half-float format and 4 for the others (the driver's padding and compression data are not known).
+// Read without g_pl: the figures of a swapchain made again meanwhile are a report late. The images of a frame
+// generation's swapchain are the ones counted (create_swapchain takes them from it).
+void vk_present_swapchain_mem(uint32_t *n, uint32_t *w, uint32_t *h, uint64_t *bytes) {
+    *n = __atomic_load_n(&g_sc_n, __ATOMIC_RELAXED);
+    *w = __atomic_load_n(&g_sc_ext.width, __ATOMIC_RELAXED), *h = __atomic_load_n(&g_sc_ext.height, __ATOMIC_RELAXED);
+    VkFormat f = __atomic_load_n(&g_sc_fmt, __ATOMIC_RELAXED);
+    uint32_t px = f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+    *bytes = __atomic_load_n(&g_sc, __ATOMIC_RELAXED) ? (uint64_t)*n * *w * *h * px : 0;
 }
 
 void vk_present_capture(int on) {
@@ -1471,14 +1640,22 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (wsys_minimized() || !g_sc) goto out;
 
     unsigned slot = g_frame % FRAMES;
-    if (vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
-        rt_log("gfx: present fence wait timed out");
+    VkResult fw = vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull);
+    if (fw != VK_SUCCESS) {
+        // A lost device ends the run here as anywhere else; a hung GPU times out at every present, so the line is
+        // kept to the first 8 and each doubling.
+        vk_device_lost_check(fw, "the present slot's fence wait");
+        static uint32_t n_fw;
+        if (++n_fw <= 8 || !(n_fw & (n_fw - 1)))
+            rt_log("gfx: present fence wait %s (%d), the frame is skipped: %u times so far",
+                   fw == VK_TIMEOUT ? "timed out" : "failed", (int)fw, n_fw);
         goto out;
     }
     pts_read(c, slot);   // the GPU timeline (vk_gtl_note): this slot's last present is done
     uint32_t idx = 0;
     // NGX frame generation: the frame is composed into ng.bb and the presenter shows it (ng_show); no acquire here
     const int ngp = ng_ready();
+    vk_lowlat_fg_presents(ngp);   // the presenter presents several times a frame: a driver's low latency steps aside
     VkResult r = ngp               ? VK_SUCCESS
                : vk_dlssg_active() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
                : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
@@ -1503,13 +1680,26 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     } else {
         n_timeouts = 0;
     }
+    if (r < 0 && r != VK_ERROR_OUT_OF_DATE_KHR) {   // an error (the surface lost, say), logged once per code
+        static VkResult seen[8];
+        static int nseen;
+        int k = 0;
+        while (k < nseen && seen[k] != r) k++;
+        if (k == nseen && nseen < 8) {
+            seen[nseen++] = r;
+            rt_log("gfx: the acquire of a swapchain image failed (%d%s): the frame is skipped", (int)r,
+                   r == VK_ERROR_SURFACE_LOST_KHR ? ", the window's surface is lost" : "");
+        }
+    }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;
     if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
     if (g_sc_hdr) vk_hdr_metadata(g_sc, 0);   // a changed peak or white goes to the display
     if (g_th_pending[slot]) {   // that fence has signalled: the thumbnail its submission wrote is complete
-        g_th_tag[g_th_pending[slot] % (uint64_t)g_th_n] = g_th_pending[slot];
+        uint64_t done = g_th_pending[slot];
+        g_th_tag[done % (uint64_t)g_th_n] = done;
         g_th_pending[slot] = 0;
+        if (flight_flash_on && g_th_ptr) thumb_cells(done);
     }
 
     int cx = 0, cy = 0, cw = w, ch = h;
@@ -1665,6 +1855,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &wait,
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
+    // A driver's low latency (vk_lowlat.c): the game frame this blit shows, and NVIDIA's tag with its number
+    VkLatencySubmissionPresentIdNV ll_tag;
+    int ll_tagged = 0;
+    const uint64_t ll_frame = src ? vk_lowlat_blit_frame(&ll_tag, &ll_tagged) : 0;
+    if (ll_tagged) si.pNext = &ll_tag;
     const uint64_t ng_n = ng.n + 1;   // through the presenter: this frame's number on its timelines
     if (via_ng) {
         // No acquire to wait for. The frame writes one of the presenter's two image sets: it waits on the GPU until
@@ -1688,6 +1883,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     } else if (r == VK_SUCCESS) {
         g_flip_on = 1;
         g_flip_idx = idx;
+        g_flip_frame = ll_frame;
         if (!defer) flip_locked();
     } else {
         vk_device_lost_check(r, "the present's submit");
@@ -1705,8 +1901,18 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         plat_xchg32(&g_dirty, 1);
     }
     g_frame++;
-    if (cap) {
-        vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull);
+    VkResult cap_r = cap ? vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) : VK_SUCCESS;
+    if (cap && cap_r != VK_SUCCESS) {   // the read-back buffer may not hold this frame yet: nothing reads it
+        vk_device_lost_check(cap_r, "the wait for a captured frame");
+        g_cap_valid = 0;
+        static int logged;
+        if (logged++ < 8) rt_log("gfx: the wait for a captured frame ended with %d: no capture this frame", (int)cap_r);
+        if (grab) {
+            void (*cb)(VkGrab *g, void *ctx) = g_grab_cb;
+            g_grab_cb = NULL;
+            cb(NULL, g_grab_ctx);
+        }
+    } else if (cap) {
         vmaInvalidateAllocation(c->vma, g_cap_alloc, 0, VK_WHOLE_SIZE);
         g_cap_w = (int)g_sc_ext.width;
         g_cap_h = (int)g_sc_ext.height;
@@ -1758,6 +1964,7 @@ void gfx_window_release_vk(void) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
         vk_queue_unlock();
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
+        vk_lowlat_swapchain(VK_NULL_HANDLE, 0);
         ng_release();    // NGX frame generation's presenter shows nothing more; its images go before the device
         menu_vk_release();
         vk_fsr_release();
@@ -1820,4 +2027,16 @@ void gfx_window_start(void) {
     }
     plat_rmutex_unlock(&g_start_lock);
     vsync_ensure();
+}
+
+int gfx_window_in_front(void) { return gfx_window_focused() && !wsys_minimized(); }
+
+// For the hang watch's report (hang_watch.c): who holds the present, queue and window-start locks now, read without
+// taking them (0: free). The fields may be caught mid-change; the report only names them.
+void gfx_lock_holders(GfxLockHolders *h) {
+    h->present = __atomic_load_n(&g_pl.owner, __ATOMIC_RELAXED);
+    h->present_depth = __atomic_load_n(&g_pl.depth, __ATOMIC_RELAXED);
+    h->queue = __atomic_load_n(&g_ql.owner, __ATOMIC_RELAXED);
+    h->queue_depth = __atomic_load_n(&g_ql.depth, __ATOMIC_RELAXED);
+    h->start = __atomic_load_n(&g_start_lock.owner, __ATOMIC_RELAXED);
 }

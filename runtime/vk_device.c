@@ -11,11 +11,16 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "mem_budget.h"
 #include "vk.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#include "vk_gpa.h"
 #include "vk_fg.h"
 #include "vk_dlssg.h"
+#include "vk_dlssg_device.h"
+#include "vk_lowlat.h"
+#include "vk_mesh_path.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
 PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
@@ -298,8 +303,9 @@ static int name_has(const char *s, const char *sub) {
     return 0;
 }
 
-// First discrete GPU with Vulkan 1.3, the required extensions and a graphics+present queue; NX2NAVI_GPU_INDEX (index) or
-// NX2NAVI_GPU_NAME (case-insensitive part of the name) overrides.
+// First discrete GPU with Vulkan 1.3, the required extensions and a graphics+present queue (of one GPU listed by two
+// drivers, the newer driver's listing); NX2NAVI_GPU_INDEX (index) or NX2NAVI_GPU_NAME (case-insensitive part of the
+// name) overrides.
 static int pick_device(void) {
     uint32_t n = 0;
     vk_dlssg_enumerate(g_vk.instance, &n, NULL);
@@ -310,6 +316,7 @@ static int pick_device(void) {
     int want = e && *e ? atoi(e) : -1;
     const char *name = cfg_get("NX2NAVI_GPU_NAME");
     int best = -1, best_score = -1, listed = 0;
+    uint32_t best_driver = 0;   // the driver version of the best one so far
 retry:
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
@@ -319,6 +326,14 @@ retry:
                    VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion));
         if (want >= 0 && (int)i != want) continue;
         if (name && *name && !name_has(p.deviceName, name)) continue;
+        // A chosen card of another vendor while DLSS Frame Generation is on: the interposer cannot make its device
+        // (vk_dlssg_create_device), and the settings ask for what only an NVIDIA card runs. Not usable, so the best
+        // usable one is taken below, as for a card that is gone; where no NVIDIA card is usable either, the pass
+        // without a choice takes what there is and the device is made without frame generation.
+        if (dlssg_card_skipped(vk_dlssg_interposed(), want >= 0 || (name && *name), p.vendorID)) {
+            rt_log("vk: gpu %u skipped: DLSS Frame Generation is on (framegen = dlss), which only an NVIDIA card runs", i);
+            continue;
+        }
         if (p.apiVersion < VK_API_VERSION_1_3) { rt_log("vk: gpu %u skipped: Vulkan below 1.3", i); continue; }
         const char *miss = missing_required(pd[i]);
         if (miss) { rt_log("vk: gpu %u skipped: missing extension %s", i, miss); continue; }
@@ -331,7 +346,19 @@ retry:
         if (fam == UINT32_MAX) { rt_log("vk: gpu %u skipped: no graphics+compute+present queue family", i); continue; }
         int score = (int)i == want ? 100 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
                   : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
-        if (score > best_score) { best_score = score; best = (int)i; }
+        if (score > best_score) { best_score = score; best = (int)i; best_driver = p.driverVersion; continue; }
+        // The same GPU listed again by another installed driver (a laptop with the vendor's processor graphics and its
+        // card has both drivers list the card): the newer driver's listing. The older one, there to serve the processor
+        // graphics, was reported to crash in its shader compiler with the card.
+        if (score == best_score && best >= 0) {
+            VkPhysicalDeviceProperties b;
+            vkGetPhysicalDeviceProperties(pd[best], &b);
+            if (b.vendorID == p.vendorID && b.deviceID == p.deviceID && p.driverVersion > best_driver) {
+                if (!listed) rt_log("vk: gpu %u is gpu %d listed by a newer driver (%#x over %#x): gpu %u", i, best,
+                                    p.driverVersion, best_driver, i);
+                best = (int)i, best_driver = p.driverVersion;
+            }
+        }
     }
     // A chosen GPU that is not usable or no longer there (the menu's GPU row, an unplugged card, a driver that lists the
     // devices in another order): the best usable one instead, so the game still starts and the choice can be changed
@@ -368,6 +395,15 @@ retry:
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
     vk_caps_driver(g_vk.phys);   // before vk_mem_class_log, which chooses the pools' storage by driver
+    {   // and by whether the device imports dma-bufs (vk_memory.c "dma-buf imports")
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
+        VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
+        vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
+        vk_mem_dmabuf_caps(has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+                           has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME));
+        free(ep);
+    }
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
@@ -378,10 +414,11 @@ retry:
 // the next memory type that allows it (the other device-local heap first), for every allocation: textures, render
 // targets, VRAM mirrors, pools. The limit is each device-local heap's budget when the device is made (VK_EXT_memory_budget,
 // what other programs leave) less a margin for memory VMA does not see (swapchain, FidelityFX): a tenth, at least
-// 256 MiB. NX2NAVI_VRAM_HEAP_LIMIT: auto (with low_end_gpu = 1), 0 (no limits, the default), or a number of MiB for the largest device-local heap.
+// 256 MiB. NX2NAVI_VRAM_HEAP_LIMIT: auto, 0 (no limits, the default) or a number of MiB for the largest device-local
+// heap. The low-end GPU mode set auto up to 0.10.1.
 static int vram_heap_limits(VkDeviceSize *limit) {
     const char *e = cfg_get("NX2NAVI_VRAM_HEAP_LIMIT");
-    long mb = !e || !*e ? 0 : strcmp(e, "auto") ? atol(e) : -1;   // unset: no limits, as before (low_end_gpu sets auto)
+    long mb = !e || !*e ? 0 : strcmp(e, "auto") ? atol(e) : -1;   // unset: no limits
     if (!mb) return 0;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
@@ -445,15 +482,36 @@ typedef struct {
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT saf;
+    VkPhysicalDevicePresentIdFeaturesKHR pid;
+    VkPhysicalDeviceAntiLagFeaturesAMD antilag;
 } FeatureChain;
 
 // One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
 // that change how the game's memory behaves. A report often arrives as the end of a log alone, or as a picture of it,
 // and the lines that say these things are at its start. No lock is taken: the failing thread may hold any.
+// How the game's task and mesh programs are drawn (create_device decides it): natively, through the mesh fallback, the
+// mesh emulation, or not at all. Every RX 6000 loss whose marks named a pass was in one that starts with a mesh draw.
+static const char *g_mesh_path = "not decided yet";
+
 static void fatal_note(void) {
     char mem[512];
     vk_mem_fatal_note(mem, sizeof mem);
-    rt_log("fatal: gpu %s; %s; texture detail %s", vk_caps_summary(), mem, vk_texture_detail_name());
+    rt_log("fatal: gpu %s; %s; texture detail %s; mesh draws %s", vk_caps_summary(), mem, vk_texture_detail_name(),
+           g_mesh_path);
+}
+
+// NX2NAVI_TRACE=perf: every device memory allocation VMA makes, timed as the "device memory allocations" work mark
+// (perf.c mark_text). An area's first visit made 78 of them, 4.4 GB, in a frame of 421 ms of which about 180 ms
+// showed in no mark; vk_headroom.c measured 8-19 ms per 256 MiB block. VMA takes this one function from the
+// allocator's create info and the others from its static table (vk_vma.cpp VMA_STATIC_VULKAN_FUNCTIONS). A failed
+// attempt counts too, with its time and 0 bytes: VMA may then try again with a smaller block, and the failed call held
+// the frame as well, so the mark's count can pass the number of allocations made.
+static VkResult VKAPI_PTR timed_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb,
+                                      VkDeviceMemory *m) {
+    uint64_t t0 = perf_mark_begin();
+    VkResult r = vkAllocateMemory(d, ai, cb, m);
+    perf_mark_end(PERF_M_DEVMEM, t0, r == VK_SUCCESS ? ai->allocationSize : 0);
+    return r;
 }
 
 static int create_device(void) {
@@ -562,6 +620,35 @@ static int create_device(void) {
         g_vk.has_nv_checkpoints = 1;
         ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
     }
+    // Guest memory imported as dma-bufs (vk_memory.c "dma-buf imports"; pick_device checked the extensions)
+    if (vk_mem_dmabuf_on() && n_ext + 4 <= sizeof ext / sizeof *ext) {
+        ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    }
+    // Low latency without frame generation (vk_lowlat.c): NVIDIA's extension, which needs VK_KHR_present_id enabled
+    // with it, or AMD's, whose calls need its feature. Each only where the driver lists it; a driver lists one of them
+    // at most. Not on a device the DLSS Frame Generation proxies make (vk_dlssg_create_device): that path's own
+    // low-latency plugin asks for what it needs there, and the direct path stays off for the run. And only in a run
+    // that starts with NX2NAVI_LOW_LATENCY on: with it off the device is made exactly as before the mode existed, and
+    // a driver that lists one of the two is only remembered (lists_low_latency), so the menu can say that turning the
+    // setting on takes a restart.
+    g_vk.lists_low_latency = 0;
+    if (!vk_dlssg_dpa() && n_ext + 2 <= sizeof ext / sizeof *ext) {
+        int nv = has_ext(ep, ne, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        int amd = !nv && has_ext(ep, ne, VK_AMD_ANTI_LAG_EXTENSION_NAME);
+        if (cfg_int("NX2NAVI_LOW_LATENCY") <= 0) {
+            g_vk.lists_low_latency = nv || amd;
+        } else if (nv) {
+            g_vk.has_low_latency2 = 1;
+            ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+            ext[n_ext++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
+            CHAIN(pid, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+        } else if (amd) {
+            g_vk.has_anti_lag = 1;
+            ext[n_ext++] = VK_AMD_ANTI_LAG_EXTENSION_NAME;
+            CHAIN(antilag, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD);
+        }
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -631,21 +718,32 @@ static int create_device(void) {
                                        : g_vk.has_task_shader ? "VK_EXT_mesh_shader"
                                                               : "VK_EXT_mesh_shader without task shaders (task programs are skipped)");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
-    {   // mesh_fallback: auto (on a device without mesh shaders), 1 (on every device, for testing) or 0
-        // without mesh shaders the mesh emulation (NX2NAVI_MESH_EMULATION, on unless 0) draws them; mesh_emulation = 0
-        // leaves them to this fallback
-        const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK"), *me = cfg_value("NX2NAVI_MESH_EMULATION");
-        int emu = !g_vk.has_mesh_shader && strcmp(me, "0");
-        g_vk.mesh_fallback = !emu && (!strcmp(mf, "1") || (strcmp(mf, "0") && !g_vk.has_mesh_shader));
-        if (emu) rt_log("vk: mesh shaders: emulated with compute (mesh_emulation = 1); mesh_fallback is not used");
-        else if (g_vk.mesh_fallback)
+    {   // mesh_fallback: auto, 1 (on every device) or 0 (vk_mesh_path.h says when auto takes it, and why on AMD's driver
+        // for RDNA 1 and 2). Without mesh shaders the mesh emulation (mesh_emulation = 1) draws them instead.
+        // has_mesh_shader keeps saying what the hardware has: the recorder thread (vk_rec.c) goes by it, not by how
+        // mesh programs are drawn.
+        const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK"), *me = cfg_value("NX2NAVI_MESH_EMULATION"), *why = "";
+        int path = mesh_path_decide(g_vk.has_mesh_shader, vk_caps.amd_sc, g_vk.props.vendorID == 0x10de, mf, me, &why);
+        g_vk.mesh_fallback = path == MESH_PATH_FALLBACK;
+        g_vk.mesh_emulation = path == MESH_PATH_EMULATION;
+        g_mesh_path = path == MESH_PATH_EMULATION ? "emulated (mesh_emulation)"
+                    : path == MESH_PATH_FALLBACK ? (g_vk.has_mesh_shader ? "through the mesh fallback on a device with mesh "
+                                                                           "shaders (compute passes)"
+                                                                         : "through the mesh fallback (compute passes)")
+                    : path == MESH_PATH_NATIVE ? "native (VK_EXT_mesh_shader)" : "skipped (no mesh shaders, mesh_fallback = 0)";
+        if (path == MESH_PATH_EMULATION) rt_log("vk: mesh shaders: emulated with compute (mesh_emulation = 1); mesh_fallback is not used");
+        else if (path == MESH_PATH_FALLBACK)
             rt_log("vk: mesh fallback: task and mesh programs run as compute passes and are drawn from their buffers (%s)",
-                   g_vk.has_mesh_shader ? "mesh_fallback = 1" : "this device has no mesh shaders");
-        else if (!g_vk.has_mesh_shader)
+                   why);
+        else if (path == MESH_PATH_NONE)
             rt_log("vk: mesh shaders: not supported and mesh_fallback = 0 (task/mesh draws are skipped)");
     }
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
+    // The chain enables what the driver reported: a present carries a frame's number only with presentId, and
+    // vkAntiLagUpdateAMD may be called only with antiLag (the extension alone stays enabled and unused without it).
+    g_vk.has_present_id = g_vk.has_low_latency2 && c->pid.presentId;
+    if (g_vk.has_anti_lag && !c->antilag.antiLag) g_vk.has_anti_lag = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
@@ -731,15 +829,17 @@ static int create_device(void) {
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
     vk_caps_init(&g_vk);
+    vk_mem_dmabuf_probe(g_vk.device, &g_vk.mem_props, vk_gpa_wanted_ctx(&g_vk));   // may turn shadow storage on
     vk_mem_lazy_decide();   // the driver is known: the lazy write-back's default depends on it
     rt_fatal_note_add(fatal_note);
 
+    static const VmaVulkanFunctions vf = {.vkAllocateMemory = timed_alloc};   // the rest from VMA's static table
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .preferredLargeHeapBlockSize = vk_vma_block_size(),
-                                 .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
+                                 .pDeviceMemoryCallbacks = vk_headroom_callbacks(), .pVulkanFunctions = &vf};
     VkDeviceSize heap_limit[VK_MAX_MEMORY_HEAPS];
     if (vram_heap_limits(heap_limit)) ai.pHeapSizeLimit = heap_limit;
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }
@@ -753,6 +853,7 @@ static int create_device(void) {
         return 0;
     }
     vk_crumbs_init(&g_vk);
+    vk_lowlat_init(&g_vk);
     return 1;
 }
 
@@ -764,6 +865,7 @@ static void destroy_all(void) {
     if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
+    if (g_vk.device) vk_lowlat_release();   // the sleep's semaphore: the device still lives
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
     if (lost_fence) vkDestroyFence(g_vk.device, lost_fence, NULL);   // vk_device_lost_poll
     lost_fence = VK_NULL_HANDLE;
@@ -790,10 +892,11 @@ int vk_init(void) {
     plat_mutex_lock(&g_lock);
     if (!g_ready) {
         plat_mutex_lock(&format_lock);
-    format_cache_count = 0;
-    plat_mutex_unlock(&format_lock);
-    memset(&g_vk, 0, sizeof g_vk);
-        if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start(), vk_dlaa_init();
+        format_cache_count = 0;
+        plat_mutex_unlock(&format_lock);
+        memset(&g_vk, 0, sizeof g_vk);
+        if (create_instance() && pick_device() && create_device())
+            g_ready = 1, vk_headroom_start(), vk_dlaa_init(), mem_budget_vram(1);
         else destroy_all();
     }
     int ok = g_ready;
@@ -803,7 +906,7 @@ int vk_init(void) {
 
 void vk_shutdown(void) {
     plat_mutex_lock(&g_lock);
-    if (g_ready) { destroy_all(); g_ready = 0; }
+    if (g_ready) { mem_budget_vram(0); destroy_all(); g_ready = 0; }
     plat_mutex_unlock(&g_lock);
 }
 
@@ -825,6 +928,7 @@ static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
 // The report of a lost device: the breadcrumbs, the pass marks, the video memory and the driver's fault information.
 // Once per process, on the thread that saw the loss first (vk_device_lost_check).
 static void device_fault_report(void) {
+    vk_sync_lost_report();
     vk_crumbs_report();
     vk_pass_marks_report();
     vk_mem_lost_report();
@@ -868,21 +972,29 @@ static void device_fault_report(void) {
 // the run, and nothing else touches the device meanwhile: the paths that would read vk_lost and return, and a thread
 // that gets the loss as a result of its own stops here for good.
 // LOST_EXIT_MS bounds the end. The first thread writes the report and waits for a save commit (fs_host.c
-// fs_save_crash_wait, 2 s at most); should it hang on a lock that a stopped thread holds, the watchdog ends the
-// process with the same code, and the lines already written are in the log (rt_fatal_code wrote them itself).
+// fs_save_crash_wait, 2 s at most); should it hang on a lock that a stopped thread holds, the watchdog (arg non-NULL)
+// says so in one line and ends the process with the same code, and the lines already written are in the log
+// (rt_fatal_code wrote them itself). The end is plat_terminate: ExitProcess would stop the watchdog too and then run
+// every library's detach, and a driver's detach that hangs on a lost device would hold the process for good. A thread
+// that stops here otherwise ends the process a little later, should the watchdog not have started.
 #define LOST_EXIT_MS 10000
 volatile int32_t vk_lost;
 
 static void lost_wait_exit(void *arg) {
-    (void)arg;
-    for (int t = 0; t < LOST_EXIT_MS; t += 50) plat_sleep_ms(50);
-    _Exit(RT_LOST_EXIT);
+    int watchdog = arg != NULL;
+    for (int t = 0; t < LOST_EXIT_MS + (watchdog ? 0 : 2000); t += 50) plat_sleep_ms(50);
+    if (watchdog) {
+        rt_log_ending();   // its line reaches the log file past its cap (main.c log_sink)
+        rt_log_sync();   // the queue's locks only tried (bounded): their holder may be the thread that hangs
+        rt_log("vk: the end of the run did not finish in %d s; ending it", LOST_EXIT_MS / 1000);
+    }
+    plat_terminate(RT_LOST_EXIT);
 }
 
 void vk_device_lost_check(VkResult r, const char *where) {
     if (r != VK_ERROR_DEVICE_LOST) return;
     if (plat_xchg32(&vk_lost, 1)) lost_wait_exit(NULL);   // another thread is ending the run: this one stops here
-    plat_thread_spawn(lost_wait_exit, NULL, "vk lost exit", 0);
+    plat_thread_spawn(lost_wait_exit, (void *)1, "vk lost exit", 0);
     device_fault_report();
     rt_fatal_code(RT_LOST_EXIT, "vk: the GPU device was lost (seen at: %s). The run ends here; the lines above name what "
                                 "the GPU was doing", where);
@@ -922,6 +1034,7 @@ int vk_selftest(void) {
     vmaDestroyBuffer(c->vma, buf, alloc);
 
     VkSemaphoreSignalInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline, .value = 1};
+    vk_sync_signal_note(1);   // a host signal of the timeline is noted first (vk_sync.c timeline_beyond)
     if ((r = vkSignalSemaphore(c->device, &sig)) != VK_SUCCESS) { rt_log("vk selftest: vkSignalSemaphore failed (%d)", (int)r); return 3; }
     uint64_t value = 1;
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &c->timeline,
@@ -954,5 +1067,6 @@ int probe_vkdevice(void) {
     return g_errors_total ? 1 : 0;
 }
 
-// The GPU has mesh shaders: the mesh emulation (NX2NAVI_MESH_EMULATION) does nothing there (the low-end GPU rows of the menu's Game tab).
+// The GPU has mesh shaders (vk_exec.c vk_exec_tail_begin: the early tail runs only on such a card).
 int vk_mesh_shader_native(void) { return g_vk.has_mesh_shader; }
+
